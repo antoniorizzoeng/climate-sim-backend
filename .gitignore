@@ -1,0 +1,51 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+*.manifest
+*.spec
+
+# ---- Virtual environments ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Distribution / packaging ----
+build/
+develop-eggs/
+dist/
+.eggs/
+wheels/
+pip-wheel-metadata/
+*.egg-info/
+.installed.cfg
+
+# ---- Logs / databases ----
+*.log
+*.db
+*.sqlite3
+
+# ---- Testing ----
+.coverage
+.tox/
+.nox/
+.pytest_cache/
+
+# ---- IDEs / Editors ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- OS generated ----
+.DS_Store
+Thumbs.db
+
+# ---- Docker ----
+*.pid
+docker-data/
