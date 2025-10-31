@@ -9,7 +9,7 @@ click-plugins==1.1.1.2
 click-repl==0.3.0
 fastapi==0.117.1
 h11==0.16.0
-httptools==0.6.4
+httptools==0.7.1
 idna==3.10
 kombu==5.5.4
 packaging==25.0
