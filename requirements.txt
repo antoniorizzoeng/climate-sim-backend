@@ -27,7 +27,7 @@ typing-inspection==0.4.1
 typing_extensions==4.15.0
 tzdata==2025.2
 uvicorn==0.37.0
-uvloop==0.21.0
+uvloop==0.22.1
 vine==5.1.0
 watchfiles==1.1.0
 wcwidth==0.2.14
