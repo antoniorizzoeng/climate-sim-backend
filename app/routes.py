@@ -1,7 +1,9 @@
 from fastapi import APIRouter
+
 from .tasks import run_simulation
 
 router = APIRouter()
+
 
 @router.post("/simulate")
 def simulate():
