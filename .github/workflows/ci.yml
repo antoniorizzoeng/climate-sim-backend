@@ -35,18 +35,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install black isort flake8 pytest
+          pip install black==25.11.0 isort==6.0.0 flake8==7.1.0 pytest
 
       - name: Code style check
         run: |
-          black --check .
-          isort --check-only .
+          black --check --diff --verbose .
+          isort --check-only --diff .
           flake8 .
 
       - name: Run tests
         env:
           REDIS_URL: redis://localhost:6379/0
-        run: pytest -q --maxfail=1 --disable-warnings
+        run: pytest -q --maxfail=1 --disable-warnings --cov --cov-fail-under=80
 
       - name: Build Docker image (smoke test)
         run: docker build -t climate-sim-backend:ci .

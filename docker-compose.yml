@@ -1,24 +1,50 @@
 version: "3.8"
+
 services:
   api:
     build: .
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - .:/code
+    entrypoint: ["/usr/local/bin/entrypoint-api.sh"]
     ports:
       - "8000:8000"
+    volumes:
+      - .:/code
+      - mpi_shared:/opt/mpi_shared
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
 
   worker:
     build: .
-    command: celery -A app.tasks worker --loglevel=info
+    entrypoint: ["/usr/local/bin/entrypoint-worker.sh"]
+    user: root
+    environment:
+      - CELERY_BROKER=redis://redis:6379/0
     volumes:
       - .:/code
+      - mpi_shared:/opt/mpi_shared
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+
+  mpi-node:
+    build: .
+    entrypoint: ["/usr/local/bin/entrypoint-mpi.sh"]
+    volumes:
+      - mpi_shared:/opt/mpi_shared
 
   redis:
     image: redis:7
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  mpi_shared:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: uid=1000,gid=1000,mode=0770
