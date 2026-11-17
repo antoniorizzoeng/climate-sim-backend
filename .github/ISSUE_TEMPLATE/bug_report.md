@@ -17,7 +17,7 @@ What should happen vs what actually happens.
 - OS / Distro:
 - Python version:
 - Docker / Compose version:
-- Redis version:
+- MPI engine version:
 
 **Logs / Artifacts**
-Attach relevant logs, stack traces, or simulation output files (`data/`, `celery.log`, etc.).
+Attach relevant logs, stack traces, or simulation output files (`data/`, `engine.log`, etc.).

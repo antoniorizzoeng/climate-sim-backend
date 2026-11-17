@@ -1,0 +1,8 @@
+*
+!requirements.txt
+!api/
+!api/openapi.yaml
+!app/
+!app/*.py
+**/__pycache__/
+**/*.pyc

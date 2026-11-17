@@ -49,3 +49,7 @@ Thumbs.db
 # ---- Docker ----
 *.pid
 docker-data/
+
+# Local simulation state and reports
+data/
+coverage.xml

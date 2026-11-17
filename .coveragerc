@@ -5,6 +5,8 @@ source = app
 [report]
 show_missing = True
 skip_covered = True
+fail_under = 90
+precision = 2
 
 [xml]
 output = coverage.xml
