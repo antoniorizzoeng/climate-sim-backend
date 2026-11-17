@@ -1,0 +1,149 @@
+[
+  {
+    "latitude": 44.990112,
+    "longitude": 10.0017805,
+    "generationtime_ms": 13.944745063781738,
+    "utc_offset_seconds": 0,
+    "timezone": "GMT",
+    "timezone_abbreviation": "GMT",
+    "elevation": 40.0,
+    "hourly_units": {
+      "time": "iso8601",
+      "cloud_cover_low": "%",
+      "cloud_cover_mid": "%",
+      "cloud_cover_high": "%",
+      "cloud_cover": "%",
+      "wind_speed_850hPa": "m/s",
+      "wind_direction_850hPa": "°",
+      "wind_speed_500hPa": "m/s",
+      "wind_direction_500hPa": "°",
+      "wind_speed_300hPa": "m/s",
+      "wind_direction_300hPa": "°",
+      "wind_speed_250hPa": "m/s"
+    },
+    "hourly": {
+      "time": [
+        "2026-11-17T23:00",
+        "2026-11-18T00:00"
+      ],
+      "cloud_cover_low": [
+        86,
+        80
+      ],
+      "cloud_cover_mid": [
+        0,
+        91
+      ],
+      "cloud_cover_high": [
+        0,
+        0
+      ],
+      "cloud_cover": [
+        86,
+        99
+      ],
+      "wind_speed_850hPa": [
+        14.13,
+        14.87
+      ],
+      "wind_direction_850hPa": [
+        234,
+        239
+      ],
+      "wind_speed_500hPa": [
+        34.16,
+        30.67
+      ],
+      "wind_direction_500hPa": [
+        276,
+        269
+      ],
+      "wind_speed_300hPa": [
+        67.23,
+        70.84
+      ],
+      "wind_direction_300hPa": [
+        291,
+        289
+      ],
+      "wind_speed_250hPa": [
+        66.87,
+        67.59
+      ]
+    }
+  },
+  {
+    "latitude": 45.013794,
+    "longitude": 10.0270605,
+    "generationtime_ms": 13.924360275268555,
+    "utc_offset_seconds": 0,
+    "timezone": "GMT",
+    "timezone_abbreviation": "GMT",
+    "elevation": 38.0,
+    "location_id": 1,
+    "hourly_units": {
+      "time": "iso8601",
+      "cloud_cover_low": "%",
+      "cloud_cover_mid": "%",
+      "cloud_cover_high": "%",
+      "cloud_cover": "%",
+      "wind_speed_850hPa": "m/s",
+      "wind_direction_850hPa": "°",
+      "wind_speed_500hPa": "m/s",
+      "wind_direction_500hPa": "°",
+      "wind_speed_300hPa": "m/s",
+      "wind_direction_300hPa": "°",
+      "wind_speed_250hPa": "m/s"
+    },
+    "hourly": {
+      "time": [
+        "2026-11-17T23:00",
+        "2026-11-18T00:00"
+      ],
+      "cloud_cover_low": [
+        85,
+        90
+      ],
+      "cloud_cover_mid": [
+        9,
+        88
+      ],
+      "cloud_cover_high": [
+        0,
+        3
+      ],
+      "cloud_cover": [
+        91,
+        99
+      ],
+      "wind_speed_850hPa": [
+        14.76,
+        15.11
+      ],
+      "wind_direction_850hPa": [
+        234,
+        239
+      ],
+      "wind_speed_500hPa": [
+        34.53,
+        30.67
+      ],
+      "wind_direction_500hPa": [
+        276,
+        269
+      ],
+      "wind_speed_300hPa": [
+        66.91,
+        70.21
+      ],
+      "wind_direction_300hPa": [
+        291,
+        289
+      ],
+      "wind_speed_250hPa": [
+        66.99,
+        67.69
+      ]
+    }
+  }
+]

@@ -17,7 +17,9 @@ from fastapi import HTTPException
 
 from . import netcdf
 from .models import ENGINE_INT_MAX, FieldSource, invalid, issue, resolve
+from .nowcasts import Nowcasts
 from .render import display_range, encode, export_name
+from .sky import wind_config
 from .storage import Collection
 
 ACTIVE = timedelta(days=7)
@@ -92,6 +94,7 @@ class RunManager:
         self.active = None
         self.exports = {}
         self.closing = False
+        self.nowcasts = Nowcasts(self, ACTIVE)
 
     async def start(self):
         self.settings.data.mkdir(parents=True, exist_ok=True)
@@ -111,6 +114,7 @@ class RunManager:
                     self.finish(run, "interrupted by restart")
                 elif run["status"] == "queued":
                     self.queue.append(run["id"])
+            await self.nowcasts.start()
             await self.cleanup()
             self.description = await asyncio.to_thread(self.settings.engine_description)
             self.worker = asyncio.create_task(self.work())
@@ -122,6 +126,7 @@ class RunManager:
 
     async def close(self):
         async with self.lock:
+            await self.nowcasts.close()
             self.closing = True
             self.wake.set()
             await self.stop_process()
@@ -140,6 +145,7 @@ class RunManager:
 
     async def cleanup(self):
         now = self.clock()
+        self.nowcasts.cleanup(now)
         for run in list(self.runs.records.values()):
             if run["status"] in ("queued", "running"):
                 continue
@@ -185,8 +191,8 @@ class RunManager:
             expires_at=(now + ACTIVE).isoformat(),
         )
 
-    async def add_field(self, source, name, stream, shape=None):
-        with self.fields.staging() as (identifier, directory):
+    async def add_field(self, source, name, stream, shape=None, identifier=None):
+        with self.fields.staging(identifier) as (identifier, directory):
             path = directory / "original.nc"
 
             def ingest():
@@ -252,82 +258,93 @@ class RunManager:
                     plane[missing] = src.fill_value
         return report, plane
 
-    async def submit(self, req, validate=False):
+    async def submit(self, req, validate=False, wind_limit=None):
         async with self.lock:
-            try:
-                report, plane = await asyncio.to_thread(self.assess, req)
-            except HTTPException as exc:
-                if not validate:
-                    raise
-                errors = (
-                    [issue("source.field_id", exc.detail)]
-                    if exc.status_code == 404
-                    else exc.detail
+            return await self.submit_locked(req, validate, wind_limit=wind_limit)
+
+    async def submit_locked(
+        self, req, validate=False, wind_limit=None, identifier=None
+    ):
+        try:
+            report, plane = await asyncio.to_thread(self.assess, req)
+        except HTTPException as exc:
+            if not validate:
+                raise
+            errors = (
+                [issue("source.field_id", exc.detail)]
+                if exc.status_code == 404
+                else exc.detail
+            )
+            return dict(ok=False, resolved=None, errors=errors, warnings=[])
+        if validate:
+            return report
+        if not report["ok"]:
+            raise HTTPException(422, report["errors"])
+        resolved = report["resolved"]
+        with self.runs.staging(identifier) as (identifier, staging):
+            directory = self.runs.root / identifier
+            if plane is None:
+                ic = {"mode": "preset", "preset": req.source.preset}
+            else:
+                await asyncio.to_thread(netcdf.write_plane, staging / "input.nc", plane)
+                ic = {
+                    "mode": "file",
+                    "var": "u",
+                    "path": str(directory / "input.nc"),
+                }
+            config = dict(
+                grid=dict(nx=resolved["nx"], ny=resolved["ny"], dx=req.dx, dy=req.dy),
+                physics=dict(D=req.D, vx=req.vx, vy=req.vy),
+                bc=req.bc.model_dump(),
+                ic=ic,
+                time=dict(
+                    dt=req.dt,
+                    steps=req.steps,
+                    out_every=min(ENGINE_INT_MAX, resolved["out_every"]),
+                ),
+            )
+            if wind_limit is not None:
+                if not self.nowcasts.supported:
+                    raise invalid("source", self.nowcasts.probe_message)
+                config["wind"] = wind_config(
+                    self.fields.root / req.source.field_id / "wind.nc"
                 )
-                return dict(ok=False, resolved=None, errors=errors, warnings=[])
-            if validate:
-                return report
-            if not report["ok"]:
-                raise HTTPException(422, report["errors"])
-            resolved = report["resolved"]
-            with self.runs.staging() as (identifier, staging):
-                directory = self.runs.root / identifier
-                if plane is None:
-                    ic = {"mode": "preset", "preset": req.source.preset}
-                else:
-                    await asyncio.to_thread(
-                        netcdf.write_plane, staging / "input.nc", plane
-                    )
-                    ic = {
-                        "mode": "file",
-                        "var": "u",
-                        "path": str(directory / "input.nc"),
-                    }
-                config = dict(
-                    grid=dict(
-                        nx=resolved["nx"], ny=resolved["ny"], dx=req.dx, dy=req.dy
-                    ),
-                    physics=dict(D=req.D, vx=req.vx, vy=req.vy),
-                    bc=req.bc.model_dump(),
-                    ic=ic,
-                    time=dict(
-                        dt=req.dt,
-                        steps=req.steps,
-                        out_every=min(ENGINE_INT_MAX, resolved["out_every"]),
-                    ),
-                )
-                (staging / "config.yaml").write_text(yaml.safe_dump(config))
-                self.sequence += 1
-                run = dict(
-                    id=identifier,
-                    _order=self.sequence,
-                    status="queued",
-                    created_at=self.clock().isoformat(),
-                    started_at=None,
-                    finished_at=None,
-                    expires_at=None,
-                    request=req.model_dump(exclude_unset=True),
-                    resolved=resolved,
-                    step=0,
-                    time=0.0,
-                    frames=0,
-                    elapsed_seconds=None,
-                    display_range=None,
-                    message=None,
-                )
-                if isinstance(req.source, FieldSource):
-                    self.touch(self.fields.records[req.source.field_id])
-                self.runs.publish(staging, run)
-            self.queue.append(identifier)
-            self.wake.set()
-            return self.view(run)
+                resolved["dt_max"] = wind_limit
+            (staging / "config.yaml").write_text(yaml.safe_dump(config))
+            self.sequence += 1
+            run = dict(
+                id=identifier,
+                _order=self.sequence,
+                _wind_limit=wind_limit,
+                status="queued",
+                created_at=self.clock().isoformat(),
+                started_at=None,
+                finished_at=None,
+                expires_at=None,
+                request=req.model_dump(exclude_unset=True),
+                resolved=resolved,
+                step=0,
+                time=0.0,
+                frames=0,
+                elapsed_seconds=None,
+                display_range=None,
+                message=None,
+            )
+            if isinstance(req.source, FieldSource):
+                self.touch(self.fields.records[req.source.field_id])
+            self.runs.publish(staging, run)
+        self.queue.append(identifier)
+        self.wake.set()
+        return self.view(run)
 
     def view(self, run):
         position = (
             self.queue.index(run["id"]) + 1 if run["status"] == "queued" else None
         )
         return {
-            k: v for k, v in dict(run, queue_position=position).items() if k != "_order"
+            k: v
+            for k, v in dict(run, queue_position=position).items()
+            if not k.startswith("_")
         }
 
     async def refresh(self, run):
@@ -354,6 +371,8 @@ class RunManager:
             message=message,
         )
 
+        self.nowcasts.notify()
+
     async def work(self):
         while True:
             await self.wake.wait()
@@ -369,6 +388,10 @@ class RunManager:
                 self.runs.update(
                     run, status="running", started_at=self.clock().isoformat()
                 )
+                self.nowcasts.notify()
+                if run.get("_wind_limit") is not None and not self.nowcasts.supported:
+                    self.finish(run, self.nowcasts.probe_message)
+                    continue
                 field_id = run["request"]["source"].get("field_id")
                 if field_id in self.fields.records:
                     self.touch(self.fields.records[field_id])
@@ -444,13 +467,17 @@ class RunManager:
 
     async def delete_run(self, identifier):
         async with self.lock:
-            run = lookup(self.runs, identifier)
-            if self.active == identifier:
-                await self.stop_process()
-            await self.stop_exports(identifier)
-            self.runs.remove(identifier)
-            if run["status"] == "queued":
-                self.queue.remove(identifier)
+            await self.delete_run_locked(identifier)
+
+    async def delete_run_locked(self, identifier):
+        run = lookup(self.runs, identifier)
+        if self.active == identifier:
+            await self.stop_process()
+        await self.stop_exports(identifier)
+        self.runs.remove(identifier)
+        if run["status"] == "queued":
+            self.queue.remove(identifier)
+        self.nowcasts.notify()
 
     async def stop_exports(self, identifier=None):
         for key, job in list(self.exports.items()):
