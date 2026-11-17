@@ -10,9 +10,10 @@ Thank you for considering contributing to climate-sim-backend!
    git checkout -b feature/your-feature
 
 2. Set up the environment:
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
+   python3.12 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements-dev.txt
+   pip install pre-commit
    pre-commit install
 
 3. Run tests to ensure everything passes:
@@ -67,10 +68,9 @@ To generate an HTML coverage report:
 ## Docker Development
 
 To test the app in Docker:
-   docker-compose up --build
+   docker compose up --build
 
-To run tests inside the container:
-   docker exec -it climate-sim-backend pytest
+For the real MPI and ffmpeg integration tests, follow the local setup in README.md and run `pytest -q`.
 
 ---
 

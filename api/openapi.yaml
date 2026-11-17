@@ -1,0 +1,700 @@
+openapi: 3.1.0
+info:
+  title: climate-sim API
+  version: 1.0.0
+  description: |
+    Backend for the climate-sim frontend. Runs the MPI engine (climate-sim-mpi-cpp) locally with mpirun.
+    Single local user, no authentication. One run executes at a time (all cores); others wait in a FIFO queue.
+
+    ## Conventions
+    - Ids are opaque strings (UUID4 hex). One id per run, used for the route, the directory and the process.
+    - Grids are row-major [ny, nx]; index (j, i) = (y, x); j = 0 is the BOTTOM row (the engine's y = 0).
+      PNGs are drawn with j = 0 at the bottom of the image. Drawing, hover, PNG and video all use this orientation.
+    - Raw value endpoints return little-endian float32, row-major (j = 0 first), with headers X-Nx and X-Ny
+      (and X-I0, X-J0, X-Stride for windows). NaN marks missing cells. CORS exposes these headers.
+    - Errors: 422 → ValidationError {detail: [{loc, msg, type}]}; every other 4xx/5xx → MessageError {detail: string}.
+    - All request objects reject unknown properties.
+
+    ## Stability (explicit upwind advection + FTCS diffusion share one timestep)
+    dt_max = 1 / (|vx|/dx + |vy|/dy + 2·D·(1/dx² + 1/dy²)); null when the denominator is 0 (any dt is stable).
+    POST /runs returns 422 when dt > dt_max. The frontend computes the same formula live and clamps.
+
+    ## Boundary conditions
+    UI labels: dirichlet = "fixed (value 0 outside)", neumann = "insulated (zero gradient)", periodic = "wrap-around".
+    periodic must be set on both opposite edges of an axis. The backend only offers what the installed engine
+    supports (ServerConfig.supported_boundary_conditions); periodic appears once engine issue #56 is fixed.
+
+    ## Timeline
+    out_every is either given or derived from `frames` (K ≥ 2): out_every = ceil(steps / (K − 1)).
+    expected_frames = 1 + ceil(steps / out_every). Frame k (0-based) is the state at step min(k·out_every, steps),
+    time = step·dt. The last frame is always the final state.
+
+    ## NetCDF ingestion
+    Accepted: classic, 64-bit offset, CDF-5 and NetCDF-4 (HDF5) files. Only numeric variables with ≥ 2 dimensions
+    are listed. The last two dimensions are (y, x); every other dimension is an "extra" dimension that needs an index
+    (default 0). If a 1-D coordinate variable for y or x is descending, that axis is reversed so j/i increase with the
+    coordinate. _FillValue / missing_value are masked (compared in stored units), then scale_factor / add_offset are
+    applied once; values are kept as float64 for simulation. Non-finite or masked cells are "missing".
+    The selected plane is written as a 2-D CDF-5 double variable "u" in the run directory and passed as ic.var=u.
+
+    ## Retention (product decision)
+    - A field is ACTIVE for 7 days after its last use (creation or a run started from it), then ARCHIVED for 30 days:
+      still listed, original file downloadable, usable for new runs or reruns (which make it active again), but no
+      preview/values. Then it is deleted.
+    - A run's outputs (frames, result.nc, exports) are deleted 7 days after it finishes; the run becomes EXPIRED and
+      keeps only its request so it can be rerun while its field exists (preset runs can always be rerun until the record
+      itself is deleted 37 days after finishing).
+    - expires_at / deleted_at timestamps are returned so the UI can show them. Cleanup runs at startup and hourly.
+
+    ## Persistence and queue
+    One manager owns DATA_DIR. A run's request is persisted before 202 is returned. On restart, queued runs are
+    resumed; a run that was running is marked error ("interrupted by restart"). DELETE of a queued/running run stops
+    mpirun (all ranks) before deleting files.
+
+servers:
+  - url: http://localhost:8000
+
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status, engine]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  engine: { type: string, description: Engine binary path and version }
+
+  /config:
+    get:
+      operationId: getServerConfig
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServerConfig" }
+
+  /fields:
+    post:
+      operationId: uploadField
+      summary: Upload a NetCDF file. The original is kept for download; selected planes are normalised per run.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        "201":
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Field" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    get:
+      operationId: listFields
+      parameters:
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+      responses:
+        "200":
+          description: Most recent first
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Field" } }
+                  next_cursor: { type: [string, "null"] }
+
+  /fields/drawn:
+    post:
+      operationId: createDrawnField
+      summary: Store a field drawn in the browser (single variable "u", no extra dimensions).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [nx, ny, data]
+              properties:
+                nx: { type: integer, minimum: 4 }
+                ny: { type: integer, minimum: 4 }
+                name: { type: string, default: drawn }
+                data:
+                  type: string
+                  format: binary
+                  description: Little-endian float32, row-major [ny, nx], j = 0 first; exactly 4·nx·ny bytes; all finite.
+      responses:
+        "201":
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Field" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /fields/{fieldId}:
+    parameters: [{ $ref: "#/components/parameters/FieldId" }]
+    get:
+      operationId: getField
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Field" }
+        "404": { $ref: "#/components/responses/MessageError" }
+    delete:
+      operationId: deleteField
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "409":
+          description: A queued or running run depends on this field
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageError" }
+
+  /fields/{fieldId}/original:
+    parameters: [{ $ref: "#/components/parameters/FieldId" }]
+    get:
+      operationId: downloadFieldOriginal
+      summary: The uploaded file as received (drawn fields are served as CDF-5). Available while active or archived.
+      responses:
+        "200":
+          description: File download
+          content: { application/x-netcdf: {} }
+        "404": { $ref: "#/components/responses/MessageError" }
+
+  /fields/{fieldId}/preview.png:
+    parameters: [{ $ref: "#/components/parameters/FieldId" }]
+    get:
+      operationId: getFieldPreview
+      parameters:
+        - { $ref: "#/components/parameters/Var" }
+        - { $ref: "#/components/parameters/Index" }
+        - { $ref: "#/components/parameters/Colormap" }
+        - { $ref: "#/components/parameters/Vmin" }
+        - { $ref: "#/components/parameters/Vmax" }
+        - { $ref: "#/components/parameters/MaxSide" }
+      responses:
+        "200":
+          description: Missing cells are transparent. Default range is the plane's finite min/max.
+          content: { image/png: {} }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "409": { $ref: "#/components/responses/MessageError" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /fields/{fieldId}/stats:
+    parameters: [{ $ref: "#/components/parameters/FieldId" }]
+    get:
+      operationId: getFieldPlaneStats
+      summary: Statistics of one plane (variable + extra-dimension indices).
+      parameters:
+        - { $ref: "#/components/parameters/Var" }
+        - { $ref: "#/components/parameters/Index" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlaneStats" }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "409": { $ref: "#/components/responses/MessageError" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /fields/{fieldId}/values:
+    parameters: [{ $ref: "#/components/parameters/FieldId" }]
+    get:
+      operationId: getFieldValues
+      summary: Raw float32 values of one plane or a window of it (hover readout, loading an upload into the canvas).
+      parameters:
+        - { $ref: "#/components/parameters/Var" }
+        - { $ref: "#/components/parameters/Index" }
+        - { $ref: "#/components/parameters/I0" }
+        - { $ref: "#/components/parameters/J0" }
+        - { $ref: "#/components/parameters/W" }
+        - { $ref: "#/components/parameters/H" }
+        - { $ref: "#/components/parameters/Stride" }
+      responses:
+        "200": { $ref: "#/components/responses/Float32Grid" }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "409": { $ref: "#/components/responses/MessageError" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /runs:
+    post:
+      operationId: createRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RunRequest" }
+      responses:
+        "202":
+          description: Accepted (queued, or running if the queue was empty)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    get:
+      operationId: listRuns
+      parameters:
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+      responses:
+        "200":
+          description: Most recent first
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Run" } }
+                  next_cursor: { type: [string, "null"] }
+
+  /runs/validate:
+    post:
+      operationId: validateRun
+      summary: Same checks as POST /runs without starting anything, plus resolved values and cost estimates.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RunRequest" }
+      responses:
+        "200":
+          description: Validation result for a well-formed body
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunValidation" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /runs/{runId}:
+    parameters: [{ $ref: "#/components/parameters/RunId" }]
+    get:
+      operationId: getRun
+      summary: Status and progress. Poll ~2/s while running, ~every 2 s while queued; stop at done/error/expired.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "404": { $ref: "#/components/responses/MessageError" }
+    delete:
+      operationId: deleteRun
+      summary: Stops mpirun if queued/running (returns after all ranks exited), then deletes the run and its files.
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/MessageError" }
+
+  /runs/{runId}/rerun:
+    parameters: [{ $ref: "#/components/parameters/RunId" }]
+    post:
+      operationId: rerun
+      summary: Start a new run with the same request (works for expired runs while the field exists).
+      responses:
+        "202":
+          description: New run accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /runs/{runId}/frames/{n}.png:
+    parameters:
+      - { $ref: "#/components/parameters/RunId" }
+      - { $ref: "#/components/parameters/FrameIndex" }
+    get:
+      operationId: getFramePng
+      parameters:
+        - { $ref: "#/components/parameters/Colormap" }
+        - { $ref: "#/components/parameters/Vmin" }
+        - { $ref: "#/components/parameters/Vmax" }
+        - { $ref: "#/components/parameters/MaxSide" }
+      responses:
+        "200":
+          description: Default colour range is Run.display_range. Immutable (Cache-Control) once written.
+          content: { image/png: {} }
+        "404": { description: "n ≥ expected_frames, unknown run, or outputs expired", content: { application/json: { schema: { $ref: "#/components/schemas/MessageError" } } } }
+        "409": { description: Frame not written yet, content: { application/json: { schema: { $ref: "#/components/schemas/MessageError" } } } }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /runs/{runId}/frames/{n}/values:
+    parameters:
+      - { $ref: "#/components/parameters/RunId" }
+      - { $ref: "#/components/parameters/FrameIndex" }
+    get:
+      operationId: getFrameValues
+      parameters:
+        - { $ref: "#/components/parameters/I0" }
+        - { $ref: "#/components/parameters/J0" }
+        - { $ref: "#/components/parameters/W" }
+        - { $ref: "#/components/parameters/H" }
+        - { $ref: "#/components/parameters/Stride" }
+      responses:
+        "200": { $ref: "#/components/responses/Float32Grid" }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "409": { $ref: "#/components/responses/MessageError" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /runs/{runId}/export.{format}:
+    parameters:
+      - { $ref: "#/components/parameters/RunId" }
+      - name: format
+        in: path
+        required: true
+        schema: { type: string, enum: [mp4, gif] }
+    get:
+      operationId: exportRun
+      summary: >
+        Animation of all frames, rendered frame by frame into ffmpeg in a background worker (identical requests are
+        coalesced and cached). Returns 202 with Retry-After until ready, then 200 with the file. Only when status is done.
+      parameters:
+        - name: fps
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 60, default: 12 }
+        - { $ref: "#/components/parameters/Colormap" }
+        - { $ref: "#/components/parameters/Vmin" }
+        - { $ref: "#/components/parameters/Vmax" }
+        - { $ref: "#/components/parameters/MaxSide" }
+      responses:
+        "200":
+          description: File download (Content-Disposition attachment)
+          content:
+            video/mp4: {}
+            image/gif: {}
+        "202":
+          description: Being generated
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [progress]
+                properties:
+                  progress: { type: number, minimum: 0, maximum: 1 }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "409": { $ref: "#/components/responses/MessageError" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /runs/{runId}/result.nc:
+    parameters: [{ $ref: "#/components/parameters/RunId" }]
+    get:
+      operationId: downloadResult
+      summary: Raw engine output (CDF-5, u(time, y, x)). Only when status is done.
+      responses:
+        "200":
+          description: File download
+          content: { application/x-netcdf: {} }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "409": { $ref: "#/components/responses/MessageError" }
+
+components:
+  parameters:
+    FieldId: { name: fieldId, in: path, required: true, schema: { type: string } }
+    RunId: { name: runId, in: path, required: true, schema: { type: string } }
+    FrameIndex: { name: n, in: path, required: true, schema: { type: integer, minimum: 0 } }
+    Var:
+      name: var
+      in: query
+      description: Variable name; defaults to Field.default_var.
+      schema: { type: string }
+    Index:
+      name: index
+      in: query
+      style: deepObject
+      explode: true
+      description: "Extra-dimension indices, e.g. index[time]=3&index[depth]=0; missing ones default to 0."
+      schema:
+        type: object
+        additionalProperties: { type: integer, minimum: 0 }
+    Colormap: { name: colormap, in: query, schema: { $ref: "#/components/schemas/Colormap" } }
+    Vmin: { name: vmin, in: query, description: "Must be given with vmax; finite and vmin < vmax", schema: { type: number } }
+    Vmax: { name: vmax, in: query, schema: { type: number } }
+    MaxSide:
+      name: max_side
+      in: query
+      description: Downscale (area average) so the long side is at most this many pixels. Omit for native resolution (one pixel per cell).
+      schema: { type: integer, minimum: 16 }
+    I0: { name: i0, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+    J0: { name: j0, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+    W: { name: w, in: query, description: Window width in cells (default to the edge), schema: { type: integer, minimum: 1 } }
+    H: { name: h, in: query, description: Window height in cells (default to the edge), schema: { type: integer, minimum: 1 } }
+    Stride: { name: stride, in: query, description: Take every stride-th cell in both axes, schema: { type: integer, minimum: 1, default: 1 } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+    Cursor: { name: cursor, in: query, schema: { type: string } }
+
+  responses:
+    ValidationError:
+      description: Invalid request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ValidationError" }
+    MessageError:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/MessageError" }
+    Float32Grid:
+      description: Little-endian float32, row-major [h, w], j = j0 first
+      headers:
+        X-Nx: { schema: { type: integer }, description: Columns in this response }
+        X-Ny: { schema: { type: integer }, description: Rows in this response }
+        X-I0: { schema: { type: integer } }
+        X-J0: { schema: { type: integer } }
+        X-Stride: { schema: { type: integer } }
+      content: { application/octet-stream: {} }
+
+  schemas:
+    MessageError:
+      type: object
+      required: [detail]
+      properties:
+        detail: { type: string }
+
+    ValidationError:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: array
+          items: { $ref: "#/components/schemas/ValidationIssue" }
+
+    ValidationIssue:
+      type: object
+      required: [loc, msg, type]
+      properties:
+        loc: { type: array, items: { type: [string, integer] } }
+        msg: { type: string }
+        type: { type: string }
+
+    Colormap:
+      type: string
+      enum: [viridis, inferno, magma, plasma, cividis, turbo, coolwarm, gray]
+      default: viridis
+
+    BoundaryCondition:
+      type: string
+      enum: [dirichlet, neumann, periodic]
+
+    ServerConfig:
+      type: object
+      additionalProperties: false
+      required: [cpu_count, default_processes, colormaps, presets, supported_boundary_conditions, disk_free_bytes, retention]
+      properties:
+        cpu_count: { type: integer }
+        default_processes: { type: integer, description: Ranks used when RunRequest.processes is omitted (all cores) }
+        colormaps: { type: array, items: { $ref: "#/components/schemas/Colormap" } }
+        presets: { type: array, items: { $ref: "#/components/schemas/Preset" } }
+        supported_boundary_conditions: { type: array, items: { $ref: "#/components/schemas/BoundaryCondition" } }
+        disk_free_bytes: { type: integer }
+        retention:
+          type: object
+          additionalProperties: false
+          required: [active_days, archive_days]
+          properties:
+            active_days: { type: integer, const: 7 }
+            archive_days: { type: integer, const: 30 }
+
+    Preset:
+      type: string
+      enum: [gaussian_hotspot, constant_zero]
+
+    ExtraDim:
+      type: object
+      additionalProperties: false
+      required: [name, size]
+      properties:
+        name: { type: string }
+        size: { type: integer }
+        values:
+          type: [array, "null"]
+          items: { type: [number, string] }
+          description: Coordinate values (e.g. decoded times as ISO strings) when available, for the index picker labels.
+
+    Variable:
+      type: object
+      additionalProperties: false
+      required: [name, nx, ny, extra_dims]
+      properties:
+        name: { type: string }
+        nx: { type: integer }
+        ny: { type: integer }
+        extra_dims: { type: array, items: { $ref: "#/components/schemas/ExtraDim" } }
+        units: { type: [string, "null"] }
+        long_name: { type: [string, "null"] }
+
+    PlaneStats:
+      type: object
+      additionalProperties: false
+      required: [var, index, nx, ny, min, max, mean, missing_count]
+      properties:
+        var: { type: string }
+        index: { type: object, additionalProperties: { type: integer } }
+        nx: { type: integer }
+        ny: { type: integer }
+        min: { type: [number, "null"], description: Over finite, non-missing cells; null if all missing }
+        max: { type: [number, "null"] }
+        mean: { type: [number, "null"], description: Suggested default fill value }
+        missing_count: { type: integer }
+
+    Field:
+      type: object
+      additionalProperties: false
+      required: [id, source, name, created_at, state, expires_at, variables, default_var, default_stats]
+      properties:
+        id: { type: string }
+        source: { type: string, enum: [upload, drawn] }
+        name: { type: string, description: Original filename or the drawn name }
+        size_bytes: { type: integer }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time }
+        state: { type: string, enum: [active, archived] }
+        expires_at: { type: string, format: date-time, description: When it becomes archived (if active) or is deleted (if archived) }
+        variables: { type: array, items: { $ref: "#/components/schemas/Variable" } }
+        default_var: { type: string }
+        default_stats: { $ref: "#/components/schemas/PlaneStats", description: "Stats of default_var at index 0 (null-safe)" }
+
+    FieldSource:
+      type: object
+      additionalProperties: false
+      required: [kind, field_id]
+      properties:
+        kind: { type: string, const: field }
+        field_id: { type: string }
+        var: { type: string, description: Defaults to Field.default_var }
+        index: { type: object, additionalProperties: { type: integer, minimum: 0 }, description: Extra-dimension indices (default 0) }
+        fill_value:
+          type: [number, "null"]
+          description: Replaces missing cells. Required (422 otherwise) when the selected plane has missing cells.
+
+    PresetSource:
+      type: object
+      additionalProperties: false
+      required: [kind, preset, nx, ny]
+      properties:
+        kind: { type: string, const: preset }
+        preset: { $ref: "#/components/schemas/Preset" }
+        nx: { type: integer, minimum: 4 }
+        ny: { type: integer, minimum: 4 }
+
+    RunSource:
+      oneOf:
+        - { $ref: "#/components/schemas/FieldSource" }
+        - { $ref: "#/components/schemas/PresetSource" }
+      discriminator:
+        propertyName: kind
+        mapping:
+          field: "#/components/schemas/FieldSource"
+          preset: "#/components/schemas/PresetSource"
+
+    BoundaryConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        left: { $ref: "#/components/schemas/BoundaryCondition" }
+        right: { $ref: "#/components/schemas/BoundaryCondition" }
+        bottom: { $ref: "#/components/schemas/BoundaryCondition" }
+        top: { $ref: "#/components/schemas/BoundaryCondition" }
+      description: Each edge defaults to dirichlet.
+
+    RunRequest:
+      type: object
+      additionalProperties: false
+      required: [source, dt, steps]
+      properties:
+        source: { $ref: "#/components/schemas/RunSource" }
+        dx: { type: number, exclusiveMinimum: 0, default: 1.0 }
+        dy: { type: number, exclusiveMinimum: 0, default: 1.0 }
+        D: { type: number, minimum: 0, default: 0.0, description: Diffusion coefficient }
+        vx: { type: number, default: 0.0 }
+        vy: { type: number, default: 0.0 }
+        dt: { type: number, exclusiveMinimum: 0 }
+        steps: { type: integer, minimum: 1, maximum: 2147483647 }
+        out_every: { type: integer, minimum: 1, description: "Mutually exclusive with frames" }
+        frames: { type: integer, minimum: 2, description: "Frames to keep (incl. initial and final). Default 101 when neither is given." }
+        bc: { $ref: "#/components/schemas/BoundaryConfig" }
+        processes:
+          type: integer
+          minimum: 1
+          description: >
+            MPI ranks. Omitted → default_processes, automatically reduced so the MPI_Dims_create grid fits nx and ny.
+            An explicit value that does not fit, or exceeds cpu_count, is rejected.
+
+    ResolvedRun:
+      type: object
+      additionalProperties: false
+      required: [nx, ny, dt, steps, out_every, expected_frames, processes, dt_max, estimated_output_bytes]
+      properties:
+        nx: { type: integer }
+        ny: { type: integer }
+        dt: { type: number }
+        steps: { type: integer }
+        out_every: { type: integer }
+        expected_frames: { type: integer }
+        processes: { type: integer }
+        dt_max: { type: [number, "null"] }
+        estimated_output_bytes: { type: integer, description: "≈ 8·nx·ny·expected_frames + header" }
+
+    RunValidation:
+      type: object
+      additionalProperties: false
+      required: [ok, errors, warnings, resolved]
+      properties:
+        ok: { type: boolean }
+        errors: { type: array, items: { $ref: "#/components/schemas/ValidationIssue" } }
+        warnings:
+          type: array
+          items: { type: string }
+          description: Non-blocking, e.g. estimated output larger than free disk space, very long expected run.
+        resolved: { oneOf: [{ $ref: "#/components/schemas/ResolvedRun" }, { type: "null" }] }
+
+    Run:
+      type: object
+      additionalProperties: false
+      required: [id, status, created_at, request, resolved, step, time, frames, queue_position, display_range, message, expires_at]
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [queued, running, done, error, expired] }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, "null"], format: date-time }
+        finished_at: { type: [string, "null"], format: date-time }
+        expires_at: { type: [string, "null"], format: date-time, description: When outputs are deleted (done/error) or the record is deleted (expired) }
+        request: { $ref: "#/components/schemas/RunRequest" }
+        resolved: { $ref: "#/components/schemas/ResolvedRun" }
+        queue_position: { type: [integer, "null"], description: 1 = next; null unless queued }
+        step: { type: integer }
+        time: { type: number }
+        frames: { type: integer, description: "Frames 0..frames-1 are written and readable" }
+        elapsed_seconds: { type: [number, "null"] }
+        display_range:
+          type: [array, "null"]
+          items: { type: number }
+          minItems: 2
+          maxItems: 2
+          description: >
+            Fixed default colour range for the whole run, from frame 0 (widened to include 0 when any edge is dirichlet).
+            Advection–diffusion with these schemes cannot leave this range, so colours never shift during playback.
+            A constant field renders as the colormap midpoint.
+        message: { type: [string, "null"], description: Error text when status is error }
