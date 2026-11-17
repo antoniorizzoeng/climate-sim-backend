@@ -56,4 +56,14 @@ flake8 app tests
 pytest -q
 ```
 
-Test dependencies include pytest-cov. CI enforces 90% branch-inclusive coverage and builds the engine from main for the integration tests. The local suite looks for ENGINE_BIN or the development build shown above. It reports a skip reason if the executable is missing.
+For the opt-in live data check, run `RUN_NETWORK_TESTS=1 pytest -m network --no-cov`. Test dependencies include pytest-cov. CI enforces 90% branch-inclusive coverage and builds the engine from main for the integration tests. The local suite looks for ENGINE_BIN or the development build shown above. It reports a skip reason if the executable is missing.
+
+## Sky nowcast
+
+Post `{"lat":45,"lon":10}` to `/nowcasts` and poll the returned ID. The default models six hours on a 96 × 96 grid extending 300 km in each direction. The three layer IDs open ordinary run frames, PNGs and exports. Refresh creates a separate forecast with fresh data. Nowcasts expire seven days after completion.
+
+Open-Meteo supplies the initial cloud cover and hourly winds. Only the site and grid coordinates, requested variables and UTC hours are sent, with a generic User-Agent. All simulation data stays local. The client caches responses for an hour, batches up to 64 points, and counts locations and variables against the free non-commercial quota. [Forecast API](https://open-meteo.com/en/docs) · [Rate limits](https://open-meteo.com/en/pricing)
+
+Weather samples span the outer simulation cell centres on an odd regular grid capped at 17 × 17. Sample spacing is about 37 km at the default radius and 125 km at the largest radius. Bilinear interpolation supplies the engine grid. Row zero is south. Low, mid and high clouds follow winds at 850, 500 and 300 hPa, respectively. Meteorological “from” directions become east/north velocities in m/s (1 m/s = 3.6 km/h). Each layer uses zero-gradient boundaries, diffusion of 10 m²/s and a timestep at most 90% of the combined advection–diffusion stability limit. Frames are ten minutes apart.
+
+The timeline compares transported cloud fractions (random overlap for total) with Open-Meteo’s own site forecast, interpolated hourly totals included. Clear fraction estimates unobscured sky area. The hourly 250 hPa wind gives a seeing rule of thumb (good below 20 m/s, fair from 20 through 35, poor above 35). Local turbulence can dominate. Transport is most useful for a few hours. Clouds can form, dissipate or change altitude, and incoming clouds beyond the grid are unknown. Increasing the simulation resolution adds no weather observations. A startup probe checks engine wind-file support before any forecast is fetched.

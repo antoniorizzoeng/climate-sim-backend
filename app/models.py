@@ -92,8 +92,8 @@ def fits(ranks, nx, ny):
     return long <= nx and short <= ny
 
 
-def stability_limit(req):
-    if not (req.vx or req.vy or req.D):
+def stability_limit(dx, dy, diffusion, vx, vy):
+    if not (vx or vy or diffusion):
         return None
 
     def inverse_rate(dx, dy, diffusion, vx, vy):
@@ -102,7 +102,7 @@ def stability_limit(req):
             rate += 2 * diffusion * (1 / (dx * dx) + 1 / (dy * dy))
         return 1 / rate
 
-    args = (req.dx, req.dy, req.D, req.vx, req.vy)
+    args = (dx, dy, diffusion, vx, vy)
     try:
         limit = inverse_rate(*args)
         if 0 < limit < math.inf:
@@ -128,7 +128,7 @@ def resolve(req, nx, ny, settings, free_bytes):
             issue("bc", "Installed engine does not support periodic boundaries")
         )
 
-    dt_max = stability_limit(req)
+    dt_max = stability_limit(req.dx, req.dy, req.D, req.vx, req.vy)
     if dt_max is not None and req.dt > dt_max:
         errors.append(issue("dt", f"dt exceeds the stability limit {dt_max}"))
     if not math.isfinite(req.dt * req.steps):
@@ -175,3 +175,17 @@ def resolve(req, nx, ny, settings, free_bytes):
         warnings=warnings,
         resolved=None if errors else resolved,
     )
+
+
+class NowcastParams(RequestModel):
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    radius_km: float = Field(300, ge=50, le=1000)
+    hours: int = Field(6, ge=1, le=12)
+    resolution: int = Field(96, ge=16, le=256)
+
+    @model_validator(mode="after")
+    def check_projection(self):
+        if abs(self.lat) + math.degrees(self.radius_km / 6371) >= 90:
+            raise ValueError("Local equirectangular grid must stay short of the poles")
+        return self

@@ -40,8 +40,8 @@ class Collection:
                 )
 
     @contextmanager
-    def staging(self):
-        identifier = uuid4().hex
+    def staging(self, identifier=None):
+        identifier = identifier or uuid4().hex
         directory = self.root / f".new-{identifier}"
         directory.mkdir()
         try:

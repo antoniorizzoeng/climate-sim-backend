@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import netcdf
 from .manager import lookup
-from .models import Colormap, Preset, RunRequest, invalid
+from .models import Colormap, NowcastParams, Preset, RunRequest, invalid
 from .render import Style, png
 
 router = APIRouter()
@@ -296,7 +296,9 @@ async def delete_run(runId: str, m=M):
 @router.post("/runs/{runId}/rerun", status_code=202, responses={404: {}, 422: {}})
 async def rerun(runId: str, m=M):
     run = lookup(m.runs, runId)
-    return await m.submit(RunRequest.model_validate(run["request"]))
+    return await m.submit(
+        RunRequest.model_validate(run["request"]), wind_limit=run.get("_wind_limit")
+    )
 
 
 async def frame(runId: str, n: RunIndex, m=M):
@@ -369,3 +371,33 @@ async def export(
         return JSONResponse(
             {"progress": output}, status_code=202, headers={"Retry-After": "1"}
         )
+
+
+@router.post("/nowcasts", status_code=202, responses={422: {}})
+async def new_nowcast(req: NowcastParams, m=M):
+    return m.nowcasts.create(req)
+
+
+@router.get("/nowcasts", responses={422: {}})
+async def list_nowcasts(params=Depends(page_params), m=M):
+    page = paginate(m.nowcasts.records, params)
+    page["items"] = [m.nowcasts.view(item) for item in page["items"]]
+    return page
+
+
+@router.get("/nowcasts/{id}", responses={404: {}})
+async def get_nowcast(id: str, m=M):
+    return m.nowcasts.view(lookup(m.nowcasts.records, id))
+
+
+@router.delete("/nowcasts/{id}", status_code=204, responses={404: {}})
+async def delete_nowcast(id: str, m=M):
+    async with m.lock:
+        await m.nowcasts.delete(lookup(m.nowcasts.records, id))
+    return Response(status_code=204)
+
+
+@router.post("/nowcasts/{id}/refresh", status_code=202, responses={404: {}})
+async def refresh_nowcast(id: str, m=M):
+    previous = lookup(m.nowcasts.records, id)
+    return m.nowcasts.create(NowcastParams(**previous["params"]), fresh=True)

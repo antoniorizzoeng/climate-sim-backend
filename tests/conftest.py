@@ -131,3 +131,22 @@ def draw(client, plane=None, **extra):
         files={"data": ("grid.bin", plane.tobytes())},
         data={"nx": plane.shape[1], "ny": plane.shape[0], **extra},
     )
+
+
+def eastward_bank(params):
+    """A triangular cloud bank centred one source-grid interval west of the site."""
+    from app import sky
+    from app.open_meteo import UNITS
+
+    points = sky.weather_points(params)
+    side = int(len(points) ** 0.5)
+    shape = (len(points), params.hours + 1)
+    data = {key: np.zeros(shape) for key in UNITS}
+    west_distance = (params.resolution - 1) * sky.grid(params)["dx_m"] / (side - 1)
+    for layer, level in sky.LEVELS.items():
+        data[f"wind_speed_{level}hPa"][:] = west_distance / 3600
+        data[f"wind_direction_{level}hPa"][:] = 270
+        data[f"cloud_cover_{layer}"][side // 2 - 1 :: side] = 1
+    data["cloud_cover"][:] = np.linspace(0.2, 0.8, shape[1])
+    data["wind_speed_250hPa"][:] = np.linspace(20, 40, shape[1])
+    return data

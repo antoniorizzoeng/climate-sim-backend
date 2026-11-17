@@ -25,6 +25,7 @@ def test_contract(client):
     from app.main import CONTRACT
 
     spec = yaml.safe_load(CONTRACT.read_text())
+    assert spec["info"]["version"] == "1.1.0"
     expected = {
         (p, method.upper()): set(map(int, op["responses"]))
         for p, path in spec["paths"].items()
@@ -42,6 +43,7 @@ def test_contract(client):
     for schema, data in [
         ("ServerConfig", client.get("/config").json()),
         ("Run", created.json()),
+        ("Nowcast", client.post("/nowcasts", json={"lat": 45, "lon": 10}).json()),
         ("Run", wait_run(client, created.json()["id"], "error")),
         ("Field", draw(client).json()),
         ("RunValidation", client.post("/runs/validate", json=preset()).json()),
