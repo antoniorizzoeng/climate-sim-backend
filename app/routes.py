@@ -66,6 +66,14 @@ def indices(request: Request):
     return result
 
 
+def frame_view(
+    axis: Literal["z", "y", "x"] = "z",
+    index: Annotated[int | None, Query(alias="slice", ge=0)] = None,
+    projection: Literal["none", "max", "mean"] = "none",
+):
+    return netcdf.FrameView(axis, index, projection)
+
+
 def window(
     i0: Annotated[int, Query(ge=0)] = 0,
     j0: Annotated[int, Query(ge=0)] = 0,
@@ -327,7 +335,7 @@ async def rerun(runId: str, m=M):
     )
 
 
-async def frame(m, run_id, n, win=None):
+async def frame(m, run_id, n, reader, *selection):
     async with m.lock:
         run = lookup(m.runs, run_id)
         if run["status"] == "expired" or n >= run["resolved"]["expected_frames"]:
@@ -339,7 +347,7 @@ async def frame(m, run_id, n, win=None):
             raise HTTPException(409, "Frame has not been written")
         try:
             plane = await asyncio.to_thread(
-                netcdf.read_frame, m.runs.root / run_id / "result.nc", n, win
+                reader, m.runs.root / run_id / "result.nc", n, *selection
             )
         except (OSError, RuntimeError, ValueError, IndexError) as exc:
             if running:
@@ -349,9 +357,11 @@ async def frame(m, run_id, n, win=None):
 
 
 @router.get("/runs/{runId}/frames/{n}.png", responses={404: {}, 409: {}, 422: {}})
-async def frame_png(runId: str, n: RunIndex, options=Depends(style), m=M):
+async def frame_png(
+    runId: str, n: RunIndex, options=Depends(style), view=Depends(frame_view), m=M
+):
     async with m.read_slots:
-        plane, limits = await frame(m, runId, n)
+        plane, limits = await frame(m, runId, n, netcdf.read_frame, None, view)
         content = await asyncio.to_thread(png, plane, options, limits, indexed=True)
         return Response(
             content,
@@ -361,10 +371,26 @@ async def frame_png(runId: str, n: RunIndex, options=Depends(style), m=M):
 
 
 @router.get("/runs/{runId}/frames/{n}/values", responses={404: {}, 409: {}, 422: {}})
-async def frame_values(runId: str, n: RunIndex, win=Depends(window), m=M):
+async def frame_values(
+    runId: str, n: RunIndex, win=Depends(window), view=Depends(frame_view), m=M
+):
     async with m.read_slots:
-        plane, _ = await frame(m, runId, n, win)
+        plane, _ = await frame(m, runId, n, netcdf.read_frame, win, view)
         return await asyncio.to_thread(values_response, plane, win)
+
+
+@router.get("/runs/{runId}/frames/{n}/volume", responses={404: {}, 409: {}, 422: {}})
+async def frame_volume(
+    runId: str, n: RunIndex, max_side: Annotated[int, Query(ge=1, le=128)] = 64, m=M
+):
+    async with m.read_slots:
+        volume, _ = await frame(m, runId, n, netcdf.read_volume, max_side)
+        nz, ny, nx = volume.shape
+        return Response(
+            memoryview(volume).cast("B"),
+            media_type="application/octet-stream",
+            headers={"X-Nz": str(nz), "X-Ny": str(ny), "X-Nx": str(nx)},
+        )
 
 
 def completed(runId: str, m=M):
@@ -393,11 +419,12 @@ async def export(
     format: Literal["mp4", "gif"],
     fps: Annotated[int, Query(ge=1, le=60)] = 12,
     options=Depends(style),
+    view=Depends(frame_view),
     m=M,
 ):
     async with m.lock:
         run = completed(runId, m)
-        output = m.export(run, format, fps, options)
+        output = m.export(run, format, fps, options, view)
         if isinstance(output, Path):
             return Download(
                 output,

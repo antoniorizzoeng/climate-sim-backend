@@ -107,11 +107,13 @@ def test_periodic_enabled(settings, monkeypatch):
         assert (
             "periodic" in client.get("/config").json()["supported_boundary_conditions"]
         )
-        for axis in [("left", "right"), ("top", "bottom")]:
+        for axis in [("left", "right"), ("top", "bottom"), ("front", "back")]:
             bc = {edge: "periodic" for edge in axis}
-            assert client.post("/runs/validate", json=preset(bc=bc)).json()["ok"]
+            req = preset(bc=bc)
+            req["source"]["nz"] = 3 if axis[0] == "front" else 1
+            assert client.post("/runs/validate", json=req).json()["ok"]
             del bc[axis[1]]
-            assert not client.post("/runs/validate", json=preset(bc=bc)).json()["ok"]
+            assert not client.post("/runs/validate", json=req).json()["ok"]
 
 
 @pytest.mark.parametrize("silently_ignored", [True, False])

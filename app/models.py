@@ -36,6 +36,8 @@ class FieldSource(RequestModel):
     var: str | None = None
     index: dict[str, Index] = Field(default_factory=dict)
     fill_value: float | None = None
+    volume: bool = False
+    replicate_z: int = Field(1, ge=1)
 
 
 class PresetSource(RequestModel):
@@ -43,6 +45,7 @@ class PresetSource(RequestModel):
     preset: Preset
     nx: int = Field(ge=4)
     ny: int = Field(ge=4)
+    nz: int = Field(1, ge=1)
 
 
 class BoundaryConfig(RequestModel):
@@ -50,6 +53,8 @@ class BoundaryConfig(RequestModel):
     right: Boundary = "dirichlet"
     bottom: Boundary = "dirichlet"
     top: Boundary = "dirichlet"
+    front: Boundary = "dirichlet"
+    back: Boundary = "dirichlet"
 
 
 class RunRequest(RequestModel):
@@ -58,7 +63,10 @@ class RunRequest(RequestModel):
     steps: int = Field(ge=1, le=ENGINE_INT_MAX)
     dx: float = Field(1.0, gt=0)
     dy: float = Field(1.0, gt=0)
+    dz: float = Field(1.0, gt=0)
     D: float = Field(0.0, ge=0)
+    Dz: float = Field(default_factory=lambda data: data["D"], ge=0)
+    vz: float = 0.0
     vx: float = 0.0
     vy: float = 0.0
     out_every: int | None = Field(None, ge=1)
@@ -75,7 +83,14 @@ def invalid(name, message, where="body"):
     return HTTPException(422, [issue(name, message, where)])
 
 
-def fits(ranks, nx, ny):
+def fits(ranks, nx, ny, nz=1):
+    if nz > 1:
+        # The volume engine tries alternative factorizations for thin grids.
+        return any(
+            ranks % x == 0 and ranks // x % y == 0 and ranks // (x * y) <= nz
+            for x in range(1, min(nx, ranks) + 1)
+            for y in range(1, min(ny, ranks // x) + 1)
+        )
     # Open MPI distributes prime factors largest first to the shorter axis.
     factors = []
     divisor = 2
@@ -115,15 +130,35 @@ def stability_limit(dx, dy, diffusion, vx, vy):
     return min(float(inverse_rate(*map(Decimal, args))), sys.float_info.max)
 
 
-def initial_bytes(req, nx, ny):
-    return 4096 + 8 * nx * ny if isinstance(req.source, FieldSource) else 0
+def volume_stability(req):
+    # Evaluate the engine's combined rate with an extended exponent range.
+    dx, dy, dz = map(Decimal, (req.dx, req.dy, req.dz))
+    D, Dz = map(Decimal, (req.D, req.Dz))
+    rate = (
+        abs(Decimal(req.vx)) / dx
+        + abs(Decimal(req.vy)) / dy
+        + abs(Decimal(req.vz)) / dz
+        + 2 * (D / dx**2 + D / dy**2 + Dz / dz**2)
+    )
+    return min(float(1 / rate), sys.float_info.max) if rate else None
 
 
-def resolve(req, nx, ny, settings, available_bytes):
+def initial_bytes(source, nx, ny, nz):
+    if not isinstance(source, FieldSource):
+        return 0
+    layers = 1 if source.replicate_z > 1 else nz
+    return 4096 + 8 * nx * ny * layers
+
+
+def resolve(req, nx, ny, settings, available_bytes, nz=1):
     errors = []
     if req.frames is not None and req.out_every is not None:
         errors.append(issue("frames", "frames and out_every are mutually exclusive"))
-    for a, b in [(req.bc.left, req.bc.right), (req.bc.bottom, req.bc.top)]:
+    for a, b in [
+        (req.bc.left, req.bc.right),
+        (req.bc.bottom, req.bc.top),
+        (req.bc.front, req.bc.back),
+    ]:
         if (a == "periodic") != (b == "periodic"):
             errors.append(
                 issue("bc", "Periodic boundaries must be paired on opposite edges")
@@ -133,32 +168,38 @@ def resolve(req, nx, ny, settings, available_bytes):
             issue("bc", "Installed engine does not support periodic boundaries")
         )
 
-    dt_max = stability_limit(req.dx, req.dy, req.D, req.vx, req.vy)
+    dt_max = (
+        volume_stability(req)
+        if nz > 1
+        else stability_limit(req.dx, req.dy, req.D, req.vx, req.vy)
+    )
     if dt_max is not None and req.dt > dt_max:
         errors.append(issue("dt", f"dt exceeds the stability limit {dt_max}"))
     if not math.isfinite(req.dt * req.steps):
         errors.append(issue("dt", "Total simulation time exceeds float64 range"))
-    if max(nx, ny) > ENGINE_INT_MAX:
+    if max(nx, ny, nz) > ENGINE_INT_MAX:
         errors.append(
             issue("source", "Grid dimensions exceed the engine's signed integer range")
         )
     ranks = req.processes
     if ranks is None:
-        ranks = min(settings.cpu_count, nx * ny)
-        while ranks > 1 and not fits(ranks, nx, ny):
+        ranks = min(settings.cpu_count, nx * ny * nz)
+        while ranks > 1 and not fits(ranks, nx, ny, nz):
             ranks -= 1
-    elif ranks > settings.cpu_count or not fits(ranks, nx, ny):
+    elif ranks > settings.cpu_count or not fits(ranks, nx, ny, nz):
         errors.append(
-            issue("processes", "MPI process grid must fit (nx, ny) and cpu_count")
+            issue("processes", "MPI process grid must fit the grid and cpu_count")
         )
 
     intervals = (req.frames or 101) - 1
     every = req.out_every or ((req.steps + intervals - 1) // intervals)
     count = 1 + (req.steps + every - 1) // every
-    size = 4096 + 8 * nx * ny * count
+    size = 4096 + 8 * nx * ny * nz * count
     resolved = dict(
         nx=nx,
         ny=ny,
+        nz=nz,
+        dz=req.dz,
         dt=req.dt,
         steps=req.steps,
         out_every=every,
@@ -172,7 +213,7 @@ def resolve(req, nx, ny, settings, available_bytes):
             "Estimated output and staged input exceed available disk space "
             f"above the {settings.disk_margin_bytes}-byte safety margin"
         ]
-        if size + initial_bytes(req, nx, ny) > available_bytes
+        if size + initial_bytes(req.source, nx, ny, nz) > available_bytes
         else []
     )
     if every > ENGINE_INT_MAX:

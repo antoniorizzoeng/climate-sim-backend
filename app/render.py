@@ -14,7 +14,7 @@ from PIL import Image
 
 from .disk import CHUNK_BYTES
 from .models import Colormap
-from .netcdf import read_frame, rectangles
+from .netcdf import FrameView, read_frame, rectangles
 
 
 @dataclass(frozen=True)
@@ -23,21 +23,6 @@ class Style:
     vmin: float | None = None
     vmax: float | None = None
     max_side: int | None = None
-
-
-def display_range(path, boundaries):
-    plane = read_frame(path, 0)
-    finite = np.isfinite(plane)
-    if not finite.any():
-        return None
-    lo = float(plane.min(where=finite, initial=np.inf))
-    hi = float(plane.max(where=finite, initial=-np.inf))
-    if any(
-        boundaries.get(edge, "dirichlet") == "dirichlet"
-        for edge in ("left", "right", "top", "bottom")
-    ):
-        lo, hi = min(lo, 0.0), max(hi, 0.0)
-    return [lo, hi]
 
 
 @lru_cache(maxsize=len(Colormap.__args__))
@@ -116,8 +101,11 @@ def png(values, style, limits, *, indexed=False):
     return buf.getvalue()
 
 
-def export_name(fmt, fps, style):
-    key = json.dumps([fps, asdict(style)], sort_keys=True).encode()
+def export_name(fmt, fps, style, view=FrameView()):
+    options = [fps, asdict(style)]
+    if view != FrameView():
+        options.append(asdict(view))
+    key = json.dumps(options, sort_keys=True).encode()
     return f"export-{hashlib.sha256(key).hexdigest()}.{fmt}"
 
 
@@ -260,17 +248,20 @@ def finish_mp4(fragmented, target, count, cancelled, disk):
             tmp.unlink(missing_ok=True)
 
 
-def encode(directory, target, fps, style, run, cancelled, progress, disk):
+def encode(
+    directory, target, fps, style, run, cancelled, progress, disk, view=FrameView()
+):
     tmp = target.with_suffix(".partial" + target.suffix)
     if cancelled.is_set():
         return
 
     def frame(n):
-        plane = read_frame(directory / "result.nc", n)
+        plane = read_frame(directory / "result.nc", n, view=view, cancelled=cancelled)
         return render(plane, style, run["display_range"]).convert("RGB")
 
     grid = run["resolved"]
-    size = display_size(grid["nx"], grid["ny"], style.max_side)
+    ny, nx = view.plane_shape((grid["nz"], grid["ny"], grid["nx"]))
+    size = display_size(nx, ny, style.max_side)
     process = None
     try:
         with tmp.open("wb", buffering=0) as stream:

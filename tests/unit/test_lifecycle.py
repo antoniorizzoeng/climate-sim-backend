@@ -21,11 +21,13 @@ def clean(client):
 
 def test_contract(client):
     import yaml
+    from openapi_spec_validator import validate
 
     from app.main import CONTRACT
 
     spec = yaml.safe_load(CONTRACT.read_text())
-    assert spec["info"]["version"] == "1.2.0"
+    validate(spec)
+    assert spec["info"]["version"] == "1.3.0"
     expected = {
         (p, method.upper()): set(map(int, op["responses"]))
         for p, path in spec["paths"].items()
@@ -39,14 +41,21 @@ def test_contract(client):
         for method in route.methods
     }
     assert registered == expected and spec == client.get("/openapi.json").json()
-    created = client.post("/runs", json=preset())
+    for path in ("frames/{n}.png", "frames/{n}/values", "export.{format}"):
+        params = spec["paths"]["/runs/{runId}/" + path]["get"]["parameters"]
+        refs = {p.get("$ref") for p in params}
+        for name in ("Axis", "Slice", "Projection"):
+            assert "#/components/parameters/" + name in refs
+    request = preset(dz=2, Dz=0.5, vz=1, bc={"front": "neumann", "back": "neumann"})
+    request["source"]["nz"] = 4
+    created = client.post("/runs", json=request)
     for schema, data in [
         ("ServerConfig", client.get("/config").json()),
         ("Run", created.json()),
         ("Nowcast", client.post("/nowcasts", json={"lat": 45, "lon": 10}).json()),
         ("Run", wait_run(client, created.json()["id"], "error")),
         ("Field", draw(client).json()),
-        ("RunValidation", client.post("/runs/validate", json=preset()).json()),
+        ("RunValidation", client.post("/runs/validate", json=request).json()),
         ("ValidationError", client.post("/runs", json={}).json()),
         ("MessageError", client.get("/fields/missing").json()),
     ]:
