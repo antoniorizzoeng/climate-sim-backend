@@ -69,3 +69,32 @@ def test_live_forecast(tmp_path):
     params = NowcastParams(lat=45, lon=10, hours=12)
     result = asyncio.run(api.fetch(params, start, fresh=False))
     assert result["cloud_cover"].shape == result["wind_speed_250hPa"].shape == (289, 13)
+
+
+@pytest.mark.integration
+def test_retention_preserves_queued_wind_on_restart(
+    engine_settings, clock, monkeypatch
+):
+    from app.manager import RunManager
+    from tests.unit.test_nowcasts import parked_worker
+
+    with monkeypatch.context() as patch:
+        patch.setattr(RunManager, "work", parked_worker)
+        with TestClient(create_app(engine_settings, clock)) as client:
+            manager = client.app.state.manager
+
+            async def forecast(params, start, fresh):
+                return eastward_bank(params)
+
+            patch.setattr(manager.nowcasts.forecast, "fetch", forecast)
+            accepted = client.post(
+                "/nowcasts", json=dict(lat=45, lon=10, resolution=16, hours=1)
+            )
+            url = "/nowcasts/" + accepted.json()["id"]
+            poll(client, url, lambda r: r.json()["status"] == "queued")
+
+    clock.advance(38)
+    with TestClient(create_app(engine_settings, clock)) as client:
+        result = poll(client, url, lambda r: r.json()["status"] in ("error", "done"))
+        assert result.json()["status"] == "done", result.json()["message"]
+        assert len(list((engine_settings.data / "fields").glob("*/wind.nc"))) == 3

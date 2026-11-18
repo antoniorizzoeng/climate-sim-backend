@@ -27,7 +27,7 @@ def test_contract(client):
 
     spec = yaml.safe_load(CONTRACT.read_text())
     validate(spec)
-    assert spec["info"]["version"] == "1.3.0"
+    assert spec["info"]["version"] == "1.3.1"
     expected = {
         (p, method.upper()): set(map(int, op["responses"]))
         for p, path in spec["paths"].items()
@@ -156,3 +156,51 @@ def test_rerun_expired_preset(settings, clock):
         clean(c)
         new = c.post(f"/runs/{old['id']}/rerun")
         assert new.status_code == 202 and new.json()["request"] == old["request"]
+
+
+@pytest.mark.parametrize("path", ["/fields", "/runs"])
+def test_list_contract_declares_pagination_errors(client, path):
+    result = client.get(path, params={"limit": 0})
+    assert result.status_code == 422
+    responses = client.get("/openapi.json").json()["paths"][path]["get"]["responses"]
+    assert responses["422"] == {"$ref": "#/components/responses/ValidationError"}
+
+
+def test_preexisting_upload_stats_repaired_on_startup(settings, clock):
+    import json
+
+    from app import netcdf
+
+    directory = settings.data / "fields" / "legacy"
+    directory.mkdir(parents=True)
+    path = directory / "original.nc"
+    with netcdf.dataset(path, "w") as ds:
+        ds.createDimension("y", 2)
+        ds.createDimension("x", 2)
+        ds.createVariable("u", "f8", ("y", "x"))[0] = 1
+    meta = netcdf.inspect_field(path)
+    meta["default_stats"].update(missing_count=0, max=9.969209968386869e36)
+    record = dict(
+        **meta,
+        id="legacy",
+        source="upload",
+        last_used_at=clock().isoformat(),
+        state="active",
+    )
+    metadata = directory / "metadata.json"
+    metadata.write_text(json.dumps(record))
+    with TestClient(create_app(settings, clock)) as client:
+        stats = client.get("/fields/legacy").json()["default_stats"]
+        assert stats["missing_count"] == 2 and stats["max"] == 1
+    assert json.loads(metadata.read_text())["default_stats"] == stats
+
+
+def test_health_reports_stopped_worker(settings, clock, monkeypatch):
+    from app.manager import RunManager
+
+    async def stopped(manager):
+        return
+
+    monkeypatch.setattr(RunManager, "work", stopped)
+    with TestClient(create_app(settings, clock)) as client:
+        assert client.get("/health").status_code == 503

@@ -304,3 +304,65 @@ def probe_video(path):
         "height": int(height),
         "nb_frames": len(raw) // (int(width) * int(height)),
     }
+
+
+def test_implicit_fill_is_missing_in_stats_validation_and_frame(live, tmp_path):
+    path = tmp_path / "unwritten.nc"
+    with netCDF4.Dataset(path, "w") as ds:
+        ds.createDimension("y", 4)
+        ds.createDimension("x", 4)
+        ds.createVariable("u", "f8", ("y", "x"))[:3] = 1
+    item = live.post("/fields", files={"file": (path.name, path.read_bytes())}).json()
+    assert item["default_stats"]["missing_count"] == 4
+    source = dict(kind="field", field_id=item["id"])
+    body = dict(source=source, steps=1, dt=1, processes=1)
+    assert not live.post("/runs/validate", json=body).json()["ok"]
+    source["fill_value"] = 7
+    run = wait_run(live, live.post("/runs", json=body).json()["id"])
+    values = live.get(f"/runs/{run['id']}/frames/0/values")
+    np.testing.assert_array_equal(
+        np.frombuffer(values.content, "<f4").reshape(4, 4), [[1] * 4] * 3 + [[7] * 4]
+    )
+
+
+@pytest.mark.parametrize("transition", ["running", "done"])
+def test_worker_retries_metadata_write_in_fifo_order(live, monkeypatch, transition):
+    import errno
+    from threading import Event
+
+    from app import storage
+
+    failed, restored = Event(), Event()
+    save = storage.save
+    starts = []
+    finishes = []
+
+    def flaky_save(directory, record):
+        status = record.get("status")
+        if status == transition and not restored.is_set():
+            failed.set()
+            raise OSError(errno.ENOSPC, "injected metadata failure")
+        save(directory, record)
+        if status == "running":
+            starts.append(record["id"])
+        if status == "done":
+            finishes.append(record["id"])
+
+    monkeypatch.setattr(storage, "save", flaky_save)
+    first = live.post("/runs", json=preset()).json()["id"]
+    try:
+        assert failed.wait(5)
+        assert live.get("/health").status_code == 503
+        second = live.post("/runs", json=preset()).json()["id"]
+        state = live.get("/runs/" + first).json()
+        if transition == "running":
+            assert (state["status"], state["queue_position"]) == ("queued", 1)
+        else:
+            assert state["status"] == "running"
+        assert live.get("/runs/" + second).json()["status"] == "queued"
+    finally:
+        restored.set()
+    for identifier in (first, second):
+        wait_run(live, identifier)
+    assert starts == finishes == [first, second]
+    assert live.get("/health").json()["status"] == "ok"
