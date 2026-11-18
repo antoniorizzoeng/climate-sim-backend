@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from .events import RequestLogMiddleware
 from .manager import RunManager, utcnow
 from .routes import router
 from .settings import Settings
@@ -31,7 +32,7 @@ def create_app(settings=None, clock=utcnow):
     api.include_router(router)
     api.add_middleware(
         CORSMiddleware,
-        allow_origins=list(settings.origins),
+        allow_origins=[origin for origin in settings.origins if origin != "*"],
         allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["*"],
         expose_headers=[
@@ -42,8 +43,13 @@ def create_app(settings=None, clock=utcnow):
             "X-Stride",
             "Retry-After",
             "Content-Disposition",
+            "X-Queue-Length",
+            "X-Active-Run-Id",
+            "X-Disk-Free-Bytes",
         ],
     )
+
+    api.add_middleware(RequestLogMiddleware)
 
     @api.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):

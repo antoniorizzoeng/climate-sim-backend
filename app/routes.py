@@ -4,21 +4,23 @@ import binascii
 import math
 import os
 import re
-import shutil
 from pathlib import Path
 from typing import Annotated, Literal, get_args
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Form, HTTPException
+import numpy as np
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi import Path as PathParam
-from fastapi import Query, Request, Response, UploadFile
+from fastapi import Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from . import netcdf
+from .disk import CHUNK_BYTES, DiskSpaceError
 from .manager import lookup
 from .models import Colormap, NowcastParams, Preset, RunRequest, invalid
 from .render import Style, png
+from .uploads import read_form
 
 router = APIRouter()
 RunIndex = Annotated[int, PathParam(ge=0)]
@@ -55,7 +57,12 @@ def indices(request: Request):
                     "Use index[dimension]=nonnegative_integer once per dimension",
                     "query",
                 )
-            result[match[1]] = int(value)
+            significant = value.lstrip("0")
+            if len(significant) > 20:
+                raise invalid(
+                    "index", "Index outside supported dimension range", "query"
+                )
+            result[match[1]] = int(significant or "0")
     return result
 
 
@@ -69,21 +76,17 @@ def window(
     return (i0, j0, w, h, stride)
 
 
-def values_response(plane, win):
-    ny, nx = plane.shape
-    i0, j0, w, h, stride = win
-    end_i, end_j = nx if w is None else i0 + w, ny if h is None else j0 + h
-    if i0 >= nx or j0 >= ny or end_i > nx or end_j > ny:
-        raise invalid("window", "Window lies outside the plane", "query")
-    grid = plane[j0:end_j:stride, i0:end_i:stride]
+def values_response(grid, win):
+    i0, j0, _, _, stride = win
     headers = dict(
         zip(
             ("X-Nx", "X-Ny", "X-I0", "X-J0", "X-Stride"),
             map(str, (grid.shape[1], grid.shape[0], i0, j0, stride)),
         )
     )
+    values = np.ascontiguousarray(grid, dtype="<f4")
     return Response(
-        grid.astype("<f4").tobytes(),
+        memoryview(values).cast("B"),
         headers=headers,
         media_type="application/octet-stream",
     )
@@ -123,26 +126,28 @@ def paginate(collection, params):
     return dict(items=selected, next_cursor=cursor)
 
 
-def download(path, name, media):
-    # Open under the manager lock. An overlapping DELETE can then unlink safely.
-    stream = path.open("rb")
-    size = os.fstat(stream.fileno()).st_size
+class Download(StreamingResponse):
+    def __init__(self, path, name, media):
+        # An open descriptor keeps the contents readable across retention/DELETE.
+        self.stream = path.open("rb")
+        super().__init__(
+            self.chunks(),
+            media_type=media,
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(name, safe='')}",
+                "Content-Length": str(os.fstat(self.stream.fileno()).st_size),
+            },
+        )
 
-    async def chunks():
+    async def chunks(self):
+        while block := await run_in_threadpool(self.stream.read, CHUNK_BYTES):
+            yield block
+
+    async def __call__(self, scope, receive, send):
         try:
-            while block := await asyncio.to_thread(stream.read, 256 * 1024):
-                yield block
+            await super().__call__(scope, receive, send)
         finally:
-            stream.close()
-
-    return StreamingResponse(
-        chunks(),
-        media_type=media,
-        headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(name, safe='')}",
-            "Content-Length": str(size),
-        },
-    )
+            self.stream.close()
 
 
 M = Depends(manager)
@@ -150,7 +155,14 @@ M = Depends(manager)
 
 @router.get("/health")
 async def health(m=M):
-    return dict(status="ok", engine=m.description)
+    return JSONResponse(
+        dict(status="ok", engine=m.description),
+        headers={
+            "X-Queue-Length": str(len(m.queue)),
+            "X-Active-Run-Id": m.active or "",
+            "X-Disk-Free-Bytes": str(m.disk.free),
+        },
+    )
 
 
 @router.get("/config")
@@ -164,32 +176,26 @@ async def server_config(m=M):
         colormaps=get_args(Colormap),
         presets=get_args(Preset),
         supported_boundary_conditions=boundaries,
-        disk_free_bytes=shutil.disk_usage(m.settings.data).free,
+        disk_free_bytes=m.disk.free,
         retention=dict(active_days=7, archive_days=30),
     )
 
 
-class Upload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    file: UploadFile
-
-
-class Drawing(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    data: UploadFile
-    nx: int = Field(ge=4)
-    ny: int = Field(ge=4)
-    name: str = "drawn"
+async def receive_field(request, m, drawn=False):
+    with m.fields.staging() as (identifier, directory):
+        name, shape = await read_form(request, directory / "upload.part", m.disk, drawn)
+        source = "drawn" if drawn else "upload"
+        return await m.store_field(identifier, directory, source, name, shape)
 
 
 @router.post("/fields", status_code=201, responses={422: {}})
-async def upload(form: Annotated[Upload, Form(media_type="multipart/form-data")], m=M):
-    return await m.add_field("upload", form.file.filename or "field.nc", form.file.file)
+async def upload(request: Request, m=M):
+    return await receive_field(request, m)
 
 
 @router.post("/fields/drawn", status_code=201, responses={422: {}})
-async def drawn(form: Annotated[Drawing, Form(media_type="multipart/form-data")], m=M):
-    return await m.add_field("drawn", form.name, form.data.file, (form.ny, form.nx))
+async def drawn(request: Request, m=M):
+    return await receive_field(request, m, drawn=True)
 
 
 @router.get("/fields")
@@ -214,47 +220,67 @@ async def delete_field(fieldId: str, m=M):
 
 @router.get("/fields/{fieldId}/original", responses={404: {}})
 async def original(fieldId: str, m=M):
-    item = lookup(m.fields, fieldId)
-    name = item["name"] + (".nc" if item["source"] == "drawn" else "")
-    return download(
-        m.fields.root / fieldId / "original.nc", name, "application/x-netcdf"
-    )
-
-
-async def field_selection(
-    fieldId: str, var: str | None = None, index=Depends(indices), m=M
-):
     async with m.lock:
         item = lookup(m.fields, fieldId)
+        name = item["name"] + (".nc" if item["source"] == "drawn" else "")
+        return Download(m.field_path(item), name, "application/x-netcdf")
+
+
+async def field_data(m, field_id, var, index, *, window=None, stats=False):
+    async with m.lock:
+        item = lookup(m.fields, field_id)
         if item["state"] == "archived":
             raise HTTPException(409, "Field is archived")
         try:
-            plane, idx = await asyncio.to_thread(m.field_plane, item, var, index)
+            if stats:
+                return await asyncio.to_thread(
+                    netcdf.field_stats, m.field_path(item), item, var, index, m.disk
+                )
+            return await asyncio.to_thread(m.field_plane, item, var, index, window)
+        except DiskSpaceError as exc:
+            raise invalid("var", str(exc), "query") from exc
         except HTTPException as exc:
             for error in exc.detail:
                 error["loc"] = ["query", error["loc"][-1]]
             raise
-        return plane, var or item["default_var"], idx
 
 
 @router.get("/fields/{fieldId}/stats", responses={404: {}, 409: {}, 422: {}})
-async def field_stats(selection=Depends(field_selection)):
-    return await asyncio.to_thread(netcdf.stats, *selection)
+async def field_stats(
+    fieldId: str, var: str | None = None, index=Depends(indices), m=M
+):
+    async with m.read_slots:
+        return await field_data(m, fieldId, var, index, stats=True)
 
 
 @router.get("/fields/{fieldId}/preview.png", responses={404: {}, 409: {}, 422: {}})
-async def field_preview(selection=Depends(field_selection), options=Depends(style)):
-    def preview():
-        plane = selection[0]
-        stats = netcdf.stats(*selection)
-        return png(plane, options, (stats["min"], stats["max"]))
+async def field_preview(
+    fieldId: str,
+    var: str | None = None,
+    index=Depends(indices),
+    options=Depends(style),
+    m=M,
+):
+    def preview(plane):
+        summary = netcdf.stats(plane, var, {})
+        return png(plane, options, (summary["min"], summary["max"]))
 
-    return Response(await asyncio.to_thread(preview), media_type="image/png")
+    async with m.read_slots:
+        plane, _ = await field_data(m, fieldId, var, index)
+        return Response(await asyncio.to_thread(preview, plane), media_type="image/png")
 
 
 @router.get("/fields/{fieldId}/values", responses={404: {}, 409: {}, 422: {}})
-async def field_values(selection=Depends(field_selection), win=Depends(window)):
-    return await asyncio.to_thread(values_response, selection[0], win)
+async def field_values(
+    fieldId: str,
+    var: str | None = None,
+    index=Depends(indices),
+    win=Depends(window),
+    m=M,
+):
+    async with m.read_slots:
+        plane, _ = await field_data(m, fieldId, var, index, window=win)
+        return await asyncio.to_thread(values_response, plane, win)
 
 
 @router.post("/runs", status_code=202, responses={404: {}, 422: {}})
@@ -301,35 +327,44 @@ async def rerun(runId: str, m=M):
     )
 
 
-async def frame(runId: str, n: RunIndex, m=M):
+async def frame(m, run_id, n, win=None):
     async with m.lock:
-        run = lookup(m.runs, runId)
+        run = lookup(m.runs, run_id)
         if run["status"] == "expired" or n >= run["resolved"]["expected_frames"]:
             raise HTTPException(404, "Frame does not exist")
-        if run["status"] == "running":
+        running = run["status"] == "running"
+        if running:
             await m.refresh(run)
         if n >= run["frames"]:
             raise HTTPException(409, "Frame has not been written")
-        plane = await asyncio.to_thread(
-            netcdf.read_frame, m.runs.root / runId / "result.nc", n
-        )
+        try:
+            plane = await asyncio.to_thread(
+                netcdf.read_frame, m.runs.root / run_id / "result.nc", n, win
+            )
+        except (OSError, RuntimeError, ValueError, IndexError) as exc:
+            if running:
+                raise HTTPException(409, "Frame is not yet readable") from exc
+            raise
         return plane, run["display_range"]
 
 
 @router.get("/runs/{runId}/frames/{n}.png", responses={404: {}, 409: {}, 422: {}})
-async def frame_png(selection=Depends(frame), options=Depends(style)):
-    plane, limits = selection
-    content = await asyncio.to_thread(png, plane, options, limits)
-    return Response(
-        content,
-        media_type="image/png",
-        headers={"Cache-Control": "private, max-age=31536000, immutable"},
-    )
+async def frame_png(runId: str, n: RunIndex, options=Depends(style), m=M):
+    async with m.read_slots:
+        plane, limits = await frame(m, runId, n)
+        content = await asyncio.to_thread(png, plane, options, limits, indexed=True)
+        return Response(
+            content,
+            media_type="image/png",
+            headers={"Cache-Control": "private, max-age=31536000, immutable"},
+        )
 
 
 @router.get("/runs/{runId}/frames/{n}/values", responses={404: {}, 409: {}, 422: {}})
-async def frame_values(selection=Depends(frame), win=Depends(window)):
-    return await asyncio.to_thread(values_response, selection[0], win)
+async def frame_values(runId: str, n: RunIndex, win=Depends(window), m=M):
+    async with m.read_slots:
+        plane, _ = await frame(m, runId, n, win)
+        return await asyncio.to_thread(values_response, plane, win)
 
 
 def completed(runId: str, m=M):
@@ -343,10 +378,11 @@ def completed(runId: str, m=M):
 
 @router.get("/runs/{runId}/result.nc", responses={404: {}, 409: {}})
 async def result(runId: str, m=M):
-    completed(runId, m)
-    return download(
-        m.runs.root / runId / "result.nc", f"{runId}.nc", "application/x-netcdf"
-    )
+    async with m.lock:
+        completed(runId, m)
+        return Download(
+            m.runs.root / runId / "result.nc", f"{runId}.nc", "application/x-netcdf"
+        )
 
 
 @router.get(
@@ -363,7 +399,7 @@ async def export(
         run = completed(runId, m)
         output = m.export(run, format, fps, options)
         if isinstance(output, Path):
-            return download(
+            return Download(
                 output,
                 f"{runId}.{format}",
                 "video/mp4" if format == "mp4" else "image/gif",

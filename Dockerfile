@@ -24,4 +24,4 @@ COPY app ./app
 ENV DATA_DIR=/data ENGINE_BIN=/usr/local/bin/climate_sim MPIRUN_ARGS=--oversubscribe OMPI_MCA_plm=isolated
 USER api
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

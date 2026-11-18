@@ -16,6 +16,7 @@ class Settings:
     origins: tuple[str, ...]
     periodic: bool
     cpu_count: int
+    disk_margin_bytes: int = 2 * 1024**3
 
     @classmethod
     def from_env(cls):
@@ -29,6 +30,9 @@ class Settings:
             if hasattr(os, "sched_getaffinity")
             else os.cpu_count()
         )
+        disk_margin = int(os.getenv("DISK_SAFETY_MARGIN_BYTES", str(2 * 1024**3)))
+        if disk_margin < 0:
+            raise ValueError("DISK_SAFETY_MARGIN_BYTES must be nonnegative")
         return cls(
             Path(os.getenv("DATA_DIR", "data")).expanduser().resolve(),
             str(Path(executable).resolve()) if executable else engine,
@@ -41,6 +45,7 @@ class Settings:
             ),
             os.getenv("ENGINE_PERIODIC") == "1",
             cpu_count or 1,
+            disk_margin,
         )
 
     def engine_description(self):

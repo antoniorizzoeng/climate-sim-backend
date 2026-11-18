@@ -1,7 +1,6 @@
 """Durable nowcast ownership, forecast acquisition and ordinary FIFO layer runs."""
 
 import asyncio
-import io
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -174,16 +173,10 @@ class Nowcasts:
             plane, u, v = await asyncio.to_thread(
                 sky.layer_inputs, data, name, params.resolution
             )
-            await self.manager.add_field(
-                "drawn",
-                f"Sky nowcast {name}",
-                io.BytesIO(plane.astype("<f4").tobytes()),
-                plane.shape,
-                identifier=field,
+            await self.manager.add_drawn_field(
+                f"Sky nowcast {name}", plane.astype("<f4"), field
             )
-            await asyncio.to_thread(
-                sky.write_wind, self.manager.fields.root / field / "wind.nc", u, v
-            )
+            await asyncio.to_thread(self.store_wind, field, u, v)
             req, limit = sky.run_request(params, field, u, v)
             await self.manager.submit_locked(
                 req, identifier=entry["run_id"], wind_limit=limit
@@ -195,6 +188,12 @@ class Nowcasts:
             jet_ms=data["wind_speed_250hPa"][centre].tolist(),
         )
         self.records.update(record, layers=layers, _model=model, status="queued")
+
+    def store_wind(self, field, u, v):
+        path = self.manager.fields.root / field / "wind.nc"
+        size = 4096 + 8 * (u.size + v.size)
+        with self.manager.disk.reserve(size, "sky nowcast wind", path):
+            sky.write_wind(path, u, v)
 
     async def monitor(self, record):
         while True:
