@@ -326,7 +326,7 @@ class RunManager:
             label = source["preset"].replace("_", " ").capitalize()
         else:
             label = field["name"] if field else source["field_id"]
-        suffix = f" · {datetime.fromisoformat(created_at):%d %b %H:%M}"
+        suffix = f" · {datetime.fromisoformat(created_at):%d %b %H:%M} UTC"
         return label[: 120 - len(suffix)] + suffix
 
     def sample_writers(self):
