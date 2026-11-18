@@ -139,7 +139,9 @@ class Nowcasts:
 
     @staticmethod
     def view(record):
-        return {k: v for k, v in record.items() if not k.startswith("_")}
+        public = {k: v for k, v in record.items() if not k.startswith("_")}
+        public.setdefault("site_elevation", None)
+        return public
 
     async def create(self, params, fresh=False):
         now = self.manager.clock()
@@ -169,6 +171,7 @@ class Nowcasts:
                 _horizon_seconds=seconds,
                 layers=[],
                 grid=sky.grid(params),
+                site_elevation=None,
                 site=None,
                 best_window=None,
                 message=self.probe_message,
@@ -223,7 +226,11 @@ class Nowcasts:
             for k, v in sky.LEVELS.items()
         ]
         self.records.update(
-            record, _fields=fields, _planned=layers, data_time=start.isoformat()
+            record,
+            _fields=fields,
+            _planned=layers,
+            data_time=start.isoformat(),
+            site_elevation=data["site_elevation"],
         )
         for entry, field in zip(layers, fields):
             name = entry["layer"]

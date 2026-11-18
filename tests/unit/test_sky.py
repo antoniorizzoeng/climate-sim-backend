@@ -9,6 +9,99 @@ from app import netcdf, sky
 from app.models import NowcastParams
 
 
+@pytest.fixture
+def column():
+    heights = {
+        1000: 100,
+        925: 700,
+        850: 1500,
+        800: 2000,
+        700: 3000,
+        600: 4200,
+        500: 5600,
+        400: 7200,
+        350: 8000,
+        300: 9200,
+        250: 10400,
+        200: 11800,
+        150: 13500,
+        100: 16000,
+    }
+    return {level: (height, 1.0) for level, height in heights.items()}
+
+
+@pytest.mark.parametrize(
+    ("elevation", "expected"),
+    [
+        (0, (1, 1, 1)),
+        (1750, (0.5, 1, 1)),
+        (4205, (0, 0.809, 1)),
+        (9000, (0, 0, 0.90625)),
+    ],
+)
+def test_observer_in_forecast_bands(column, elevation, expected):
+    assert sky.layer_weights(elevation, column) == pytest.approx(
+        dict(zip(sky.LEVELS, expected))
+    )
+
+
+def test_cloud_at_site_and_marine_deck(column):
+    # Only the 850 hPa sample is cloudy. Its slab spans 1100–1750 m.
+    profile = {p: (z, float(p == 850)) for p, (z, _) in column.items()}
+    assert sky.layer_weights(1500, profile)["low"] == pytest.approx(500 / 650)
+    assert sky.layer_weights(2100, profile)["low"] == 0
+    profile[850] = (2000, 1)
+    assert sky.layer_weights(2100, profile)["low"] > 0
+
+
+def test_missing_cloud_samples_use_local_band_thickness(column):
+    profile = {p: (z, np.nan) for p, (z, _) in column.items()}
+    profile[700] = (3300, np.nan)
+    assert sky.layer_weights(1750, profile)["low"] == pytest.approx(1800 / 3300)
+    profile[700] = (np.nan, np.nan)
+    top = np.interp(math.log(700), np.log([600, 800]), [4200, 2000])
+    assert sky.layer_weights(1750, profile)["low"] == pytest.approx((top - 1500) / top)
+    # No measurable ceilings needed for the band entirely above the observer.
+    profile[100] = (np.nan, np.nan)
+    assert sky.layer_weights(1750, profile)["high"] == 1
+    with pytest.raises(ValueError, match="band heights"):
+        sky.layer_weights(9000, profile)
+
+
+def test_weighted_timeline_and_legacy_queued_record(monkeypatch, tmp_path):
+    weights = dict(low=0, mid=0.5, high=1)
+    raw = dict(low=1, mid=0.4, high=0)
+    forecast = dict(low=1, mid=0, high=0.2, total=1, jet_ms=10)
+    record = dict(
+        site_elevation=dict(elevation_m=5750, source="user", layer_weights=weights),
+        data_time="2026-01-01T00:00:00+00:00",
+        params=dict(hours=1, blend_tau_hours=2),
+        layers=[dict(layer=k, run_id=k) for k in sky.LEVELS],
+        _model={k: [v, v] for k, v in forecast.items()},
+    )
+    monkeypatch.setattr(sky, "site_samples", lambda path: [raw[path.parent.name]] * 7)
+    rows = sky.timeline(record, tmp_path)
+    transport = math.exp(-0.5)
+    mid, high = 0.4 * transport, 0.2 * (1 - transport)
+    clear = (1 - mid * 0.5) * (1 - high)
+    assert rows[-1]["blend"] == pytest.approx(
+        dict(low=1, mid=mid, high=high, total=1 - clear, clear=clear)
+    )
+    assert rows[-1]["nowcast"] == pytest.approx(dict(**raw, total=0.2, clear=0.8))
+    assert rows[-1]["model"] == pytest.approx(
+        dict(low=1, mid=0, high=0.2, total=0.2, clear=0.8)
+    )
+    assert sky.best_window(rows)["end"] == rows[-1]["time"]
+    del record["site_elevation"]
+    legacy = sky.timeline(record, tmp_path)
+    assert all(
+        row[series]["total"] == 1
+        for row in legacy
+        for series in ("nowcast", "model", "blend")
+    )
+    assert sky.best_window(legacy) is None
+
+
 def test_geometry_and_sampling():
     p = NowcastParams(lat=60, lon=179.99, resolution=16)
     g = sky.grid(p)

@@ -60,6 +60,8 @@ def test_unavailable_and_validation(client):
         dict(PARAMS, blend_tau_hours=-2),
         dict(PARAMS, blend_tau_hours="2"),
         dict(PARAMS, blend_tau_hours=None),
+        dict(PARAMS, elevation_m=9001),
+        dict(PARAMS, elevation_m=-501),
         dict(PARAMS, other=0),
     ):
         assert client.post("/nowcasts", json=body).status_code == 422
@@ -75,8 +77,9 @@ def test_unavailable_and_validation(client):
         resolution=96,
         blend_tau_hours=2,
         window="now",
+        elevation_m=None,
     )
-    assert item["best_window"] is None
+    assert item["best_window"] is None and item["site_elevation"] is None
     assert item["site"] is None and item["layers"] == []
     assert client.get("/nowcasts/missing").status_code == 404
     assert client.post("/nowcasts/missing/refresh").status_code == 404
@@ -86,8 +89,9 @@ def test_unavailable_and_validation(client):
 def test_queue_frames_comparison_refresh_delete_restart(supported, settings, clock):
     with TestClient(create_app(settings, clock)) as c:
         m = c.app.state.manager
-        r = c.post("/nowcasts", json=dict(PARAMS, blend_tau_hours=1.5))
+        r = c.post("/nowcasts", json=dict(PARAMS, blend_tau_hours=1.5, elevation_m=0))
         assert r.status_code == 202 and r.json()["status"] == "fetching"
+        assert r.json()["site_elevation"] is None
         url = "/nowcasts/" + r.json()["id"]
         item = await_state(c, url, "queued")
         assert item["site"] is None and item["data_time"] == clock().isoformat()
@@ -143,9 +147,18 @@ def test_queue_frames_comparison_refresh_delete_restart(supported, settings, clo
         c.portal.call(supply_frames)
         done = await_state(c, url, "done")
         spec = c.get("/openapi.json").json()
-        Draft202012Validator(
-            {"components": spec["components"], "$ref": "#/components/schemas/Nowcast"}
-        ).validate(done)
+        for schema, value in (
+            ("Nowcast", done),
+            ("NowcastParams", done["params"]),
+            ("SiteElevation", done["site_elevation"]),
+        ):
+            Draft202012Validator(
+                {
+                    "components": spec["components"],
+                    "$ref": f"#/components/schemas/{schema}",
+                }
+            ).validate(value)
+        assert done["site_elevation"]["source"] == "user"
         rows = done["site"]
         assert len(rows) == 13
         assert rows[0]["nowcast"] == pytest.approx(sky.cover(0.2, 0.3, 0.4))
@@ -157,10 +170,9 @@ def test_queue_frames_comparison_refresh_delete_restart(supported, settings, clo
                 low=weight * 0.2,
                 mid=weight * 0.3,
                 high=weight * 0.4,
-                total=weight * (1 - 0.8 * 0.7 * 0.6) + (1 - weight) * 0.5,
             )
         )
-        assert done["best_window"] is None
+        assert done["best_window"] == sky.best_window(rows, done["night"])
         assert rows[3]["model"]["total"] == pytest.approx(0.35)
         assert rows[3]["model"]["low"] == 0
         assert rows[5]["jet_ms"] == 20 and rows[6]["jet_ms"] == 30
@@ -180,6 +192,7 @@ def test_queue_frames_comparison_refresh_delete_restart(supported, settings, clo
         )
         fresh = c.post(url + "/refresh").json()
         assert fresh["id"] != done["id"] and fresh["params"] == done["params"]
+        assert fresh["params"]["elevation_m"] == 0
         await_state(c, "/nowcasts/" + fresh["id"], "queued")
         assert [flag for _, flag in supported] == [False, True]
         page = c.get("/nowcasts?limit=1").json()
@@ -225,6 +238,37 @@ def test_saved_nowcast_gains_blend_on_restart(settings, clock):
     assert upgraded["best_window"] == dict(
         start=time, end=time, mean_clear=0.9, seeing="good"
     )
+
+
+def test_v14_record_keeps_original_series_and_window(settings, clock):
+    with TestClient(create_app(settings, clock)) as c:
+        record = c.post("/nowcasts", json=PARAMS).json()
+    del record["params"]["elevation_m"], record["site_elevation"]
+    time = clock().isoformat()
+    cloud = sky.cover(1, 0, 0, total=0.2)
+    record.update(
+        status="done",
+        data_time=time,
+        message=None,
+        site=[
+            dict(
+                time=time,
+                nowcast=cloud,
+                model=cloud,
+                blend=cloud,
+                jet_ms=0,
+                seeing="good",
+            )
+        ],
+        best_window=dict(start=time, end=time, mean_clear=0.8, seeing="good"),
+    )
+    path = settings.data / "nowcasts" / record["id"] / "metadata.json"
+    path.write_text(json.dumps(record))
+    with TestClient(create_app(settings, clock)) as c:
+        expected = dict(record, site_elevation=None)
+        assert c.get(f"/nowcasts/{record['id']}").json() == expected
+        assert c.get("/nowcasts").json()["items"] == [expected]
+    assert json.loads(path.read_text()) == record
 
 
 def test_fetch_failure_expiry_and_deletion(supported, settings, clock, monkeypatch):

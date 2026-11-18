@@ -11,6 +11,13 @@ from . import netcdf
 from .models import RunRequest, stability_limit
 
 LEVELS = {"low": 850, "mid": 500, "high": 300}
+# Pressure surfaces bracketing the nominal 3 and 8 km layer boundaries.
+BAND_LEVELS = {
+    "low": (1000, 925, 850, 800, 700),
+    "mid": (700, 600, 500, 400, 350),
+    "high": (350, 300, 250, 200, 150, 100),
+}
+FOG_MARGIN_M = 250
 DIFFUSION = 10.0  # m²/s
 FRAME_SECONDS = 600
 
@@ -125,10 +132,72 @@ def site_samples(path):
         return np.clip(centre.mean(axis=(1, 2)), 0, 1)
 
 
-def cover(low, mid, high, total=None):
-    if total is None:
-        total = 1 - (1 - low) * (1 - mid) * (1 - high)
-    return dict(low=low, mid=mid, high=high, total=total, clear=1 - total)
+def layer_weights(elevation, profile):
+    """Estimate each band's above-observer share at the forecast's initial UTC hour.
+
+    Open-Meteo describes low/mid/high as roughly <3/3–8/>8 km. We use
+    the local 700 and 350 hPa heights as boundaries, from sea level up to
+    100 hPa. Geopotential heights are relative to sea level. Each pressure
+    sample represents the slab halfway to its neighbours within the band.
+    Integrate its cloud fraction times slab thickness above elevation minus
+    250 m (includes fog at site height), divided by the full-band integral.
+    Interpolate missing boundary heights in log pressure between available
+    forecast surfaces. A clear or unavailable cloud profile gets the geometric
+    thickness share. The original horizontal layer covers are preserved.
+    See https://open-meteo.com/en/docs
+    """
+    cutoff = elevation - FOG_MARGIN_M
+    if cutoff <= 0:
+        return dict.fromkeys(LEVELS, 1.0)
+    # Interpolation in log pressure approximates the hypsometric relation.
+    # Require bracketing data rather than extrapolating beyond the column.
+    measured = sorted((p, z) for p, (z, _) in profile.items() if np.isfinite(z))
+    if not measured:
+        raise ValueError("Missing Open-Meteo pressure-level heights")
+    pressure, height = np.array(measured).T
+    if (np.diff(height) > 0).any():
+        raise ValueError("Unordered Open-Meteo pressure-level heights")
+    log_pressure = np.log(pressure)
+    weights = {}
+    for layer, levels in BAND_LEVELS.items():
+        heights, cloud = np.array([profile[p] for p in levels]).T
+        bottom, top = np.interp(
+            np.log([levels[0], levels[-1]]),
+            log_pressure,
+            height,
+            left=np.nan,
+            right=np.nan,
+        )
+        if layer == "low":
+            bottom = 0.0
+        if cutoff <= bottom:
+            weights[layer] = 1.0
+            continue
+        if cutoff >= top:
+            weights[layer] = 0.0
+            continue
+        if not (np.isfinite(bottom) and np.isfinite(top) and bottom < top):
+            raise ValueError(f"Missing or invalid {layer} cloud band heights")
+        valid = np.isfinite(heights) & np.isfinite(cloud)
+        heights = np.clip(heights[valid], bottom, top)
+        edges = np.r_[bottom, (heights[:-1] + heights[1:]) / 2, top]
+        density = cloud[valid]
+        share = (top - cutoff) / (top - bottom)
+        if density.size:
+            amount = np.dot(density, np.diff(edges))
+            if amount > 0:
+                above = np.diff(np.maximum(edges, cutoff))
+                share = np.dot(density, above) / amount
+        weights[layer] = float(np.clip(share, 0, 1))
+    return weights
+
+
+def cover(low, mid, high, total=None, *, weights=None):
+    layers = dict(low=low, mid=mid, high=high)
+    if total is None or (weights is not None and min(weights.values()) < 1):
+        weights = weights or dict.fromkeys(LEVELS, 1.0)
+        total = 1 - math.prod(1 - layers[k] * weights[k] for k in LEVELS)
+    return dict(**layers, total=total, clear=1 - total)
 
 
 def seeing(speed):
@@ -137,7 +206,7 @@ def seeing(speed):
     return "poor" if speed > 35 else "fair"
 
 
-def blend_site(rows, tau_hours):
+def blend_site(rows, tau_hours, weights=None):
     if not rows:
         return []
     start = datetime.fromisoformat(rows[0]["time"])
@@ -149,9 +218,9 @@ def blend_site(rows, tau_hours):
         weight = math.exp(-lead_hours / tau_hours)
         cloud = {
             key: weight * row["nowcast"][key] + (1 - weight) * row["model"][key]
-            for key in (*LEVELS, "total")
+            for key in ((*LEVELS, "total") if weights is None else LEVELS)
         }
-        blended.append(dict(row, blend=cover(**cloud)))
+        blended.append(dict(row, blend=cover(**cloud, weights=weights)))
     return blended
 
 
@@ -186,6 +255,8 @@ def best_window(rows, night=None):
 
 def timeline(record, runs_dir):
     model = record["_model"]
+    elevation = record.get("site_elevation")
+    weights = elevation["layer_weights"] if elevation else None
     samples = {
         entry["layer"]: site_samples(runs_dir / entry["run_id"] / "result.nc")
         for entry in record["layers"]
@@ -205,10 +276,10 @@ def timeline(record, runs_dir):
         rows.append(
             dict(
                 time=(start + timedelta(seconds=elapsed)).isoformat(),
-                nowcast=cover(**at_site),
-                model=cover(**forecast),
+                nowcast=cover(**at_site, weights=weights),
+                model=cover(**forecast, weights=weights),
                 jet_ms=jet,
                 seeing=seeing(jet),
             )
         )
-    return blend_site(rows, record["params"]["blend_tau_hours"])
+    return blend_site(rows, record["params"]["blend_tau_hours"], weights)

@@ -1,0 +1,129 @@
+{
+  "latitude": 19.859402,
+  "longitude": -155.47903,
+  "generationtime_ms": 29.20699119567871,
+  "utc_offset_seconds": 0,
+  "timezone": "GMT",
+  "timezone_abbreviation": "GMT",
+  "elevation": 4196.0,
+  "hourly_units": {
+    "time": "iso8601",
+    "cloud_cover_1000hPa": "%",
+    "geopotential_height_1000hPa": "m",
+    "cloud_cover_925hPa": "%",
+    "geopotential_height_925hPa": "m",
+    "cloud_cover_850hPa": "%",
+    "geopotential_height_850hPa": "m",
+    "cloud_cover_800hPa": "%",
+    "geopotential_height_800hPa": "m",
+    "cloud_cover_700hPa": "%",
+    "geopotential_height_700hPa": "m",
+    "cloud_cover_600hPa": "%",
+    "geopotential_height_600hPa": "m",
+    "cloud_cover_500hPa": "%",
+    "geopotential_height_500hPa": "m",
+    "cloud_cover_400hPa": "%",
+    "geopotential_height_400hPa": "m",
+    "cloud_cover_350hPa": "%",
+    "geopotential_height_350hPa": "m",
+    "cloud_cover_300hPa": "%",
+    "geopotential_height_300hPa": "m",
+    "cloud_cover_250hPa": "%",
+    "geopotential_height_250hPa": "m",
+    "cloud_cover_200hPa": "%",
+    "geopotential_height_200hPa": "m",
+    "cloud_cover_150hPa": "%",
+    "geopotential_height_150hPa": "m",
+    "cloud_cover_100hPa": "%",
+    "geopotential_height_100hPa": "m"
+  },
+  "hourly": {
+    "time": [
+      "2026-11-18T11:00"
+    ],
+    "cloud_cover_1000hPa": [
+      0
+    ],
+    "geopotential_height_1000hPa": [
+      186.0
+    ],
+    "cloud_cover_925hPa": [
+      13
+    ],
+    "geopotential_height_925hPa": [
+      847.0
+    ],
+    "cloud_cover_850hPa": [
+      24
+    ],
+    "geopotential_height_850hPa": [
+      1559.0
+    ],
+    "cloud_cover_800hPa": [
+      29
+    ],
+    "geopotential_height_800hPa": [
+      2068.0
+    ],
+    "cloud_cover_700hPa": [
+      0
+    ],
+    "geopotential_height_700hPa": [
+      3178.0
+    ],
+    "cloud_cover_600hPa": [
+      0
+    ],
+    "geopotential_height_600hPa": [
+      4442.0
+    ],
+    "cloud_cover_500hPa": [
+      0
+    ],
+    "geopotential_height_500hPa": [
+      5894.0
+    ],
+    "cloud_cover_400hPa": [
+      0
+    ],
+    "geopotential_height_400hPa": [
+      7598.77
+    ],
+    "cloud_cover_350hPa": [
+      0
+    ],
+    "geopotential_height_350hPa": [
+      8576.22
+    ],
+    "cloud_cover_300hPa": [
+      3
+    ],
+    "geopotential_height_300hPa": [
+      9687.1
+    ],
+    "cloud_cover_250hPa": [
+      0
+    ],
+    "geopotential_height_250hPa": [
+      10946.67
+    ],
+    "cloud_cover_200hPa": [
+      0
+    ],
+    "geopotential_height_200hPa": [
+      12427.91
+    ],
+    "cloud_cover_150hPa": [
+      0
+    ],
+    "geopotential_height_150hPa": [
+      14229.85
+    ],
+    "cloud_cover_100hPa": [
+      0
+    ],
+    "geopotential_height_100hPa": [
+      16608.33
+    ]
+  }
+}

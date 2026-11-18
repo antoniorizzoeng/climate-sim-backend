@@ -150,4 +150,9 @@ def eastward_bank(params):
         data[f"cloud_cover_{layer}"][side // 2 - 1 :: side] = 1
     data["cloud_cover"][:] = np.linspace(0.2, 0.8, shape[1])
     data["wind_speed_250hPa"][:] = np.linspace(20, 40, shape[1])
+    data["site_elevation"] = dict(
+        elevation_m=params.elevation_m or 0,
+        source="open-meteo" if params.elevation_m is None else "user",
+        layer_weights=dict.fromkeys(sky.LEVELS, 1),
+    )
     return data
