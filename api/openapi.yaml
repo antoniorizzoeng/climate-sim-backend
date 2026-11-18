@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: climate-sim API
-  version: 1.5.0
+  version: 1.6.0
   description: |
     Backend for the climate-sim frontend. Runs the MPI engine (climate-sim-mpi-cpp) locally with mpirun.
     Single local user, no authentication. One run executes at a time (all cores); others wait in a FIFO queue.
@@ -919,7 +919,7 @@ components:
     ResolvedRun:
       type: object
       additionalProperties: false
-      required: [nx, ny, nz, dz, dt, steps, out_every, expected_frames, processes, dt_max, estimated_output_bytes]
+      required: [nx, ny, nz, dz, dt, steps, out_every, expected_frames, processes, dt_max, estimated_output_bytes, estimated_memory_bytes, memory_capacity_bytes]
       properties:
         nx: { type: integer }
         ny: { type: integer }
@@ -932,6 +932,18 @@ components:
         processes: { type: integer }
         dt_max: { type: [number, "null"] }
         estimated_output_bytes: { type: integer, description: "≈ 8·nx·ny·nz·expected_frames + header" }
+        estimated_memory_bytes:
+          type: integer
+          description: >
+            Peak RAM the engine needs for this run across all ranks, from a measured model
+            (about 28 bytes per cell plus a fixed per-run overhead, see backend docs). Independent of frames.
+        memory_capacity_bytes:
+          type: integer
+          description: >
+            RAM the engine may use on this server when no other run is active: the container/cgroup limit or
+            the machine's total memory, minus a reserve for the backend itself. A run whose
+            estimated_memory_bytes exceeds this is rejected (validation error on loc [body, source],
+            with resolved still returned so clients can show both numbers).
 
     RunValidation:
       type: object
@@ -939,7 +951,13 @@ components:
       required: [ok, errors, warnings, resolved]
       properties:
         ok: { type: boolean }
-        errors: { type: array, items: { $ref: "#/components/schemas/ValidationIssue" } }
+        errors:
+          type: array
+          items: { $ref: "#/components/schemas/ValidationIssue" }
+          description: >
+            Blocking problems. A run too large for memory is reported here (loc [body, source]) with a message like
+            "Needs about 28.6 GB of memory; this server can give the engine 6.8 GB. Use fewer layers or a smaller grid."
+            resolved is still filled in for that error.
         warnings:
           type: array
           items: { type: string }
@@ -976,7 +994,12 @@ components:
             Advection–diffusion with these schemes cannot leave this range, so colours never shift during playback.
             A constant field renders as the colormap midpoint. Slices and projections of a nonuniform volume
             use the run range even when every pixel in the view has the same value.
-        message: { type: [string, "null"], description: Error text when status is error }
+        message:
+          type: [string, "null"]
+          description: >
+            Error text when status is error. The first line is a short human-readable reason
+            (e.g. "The engine ran out of memory and was stopped by the system."); any following lines
+            are the engine's raw output, for a collapsible details view.
 
     NowcastParams:
       type: object

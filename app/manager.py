@@ -2,6 +2,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import threading
@@ -17,6 +18,7 @@ from fastapi import HTTPException
 from . import models, netcdf
 from .disk import DiskBudget, DiskSpaceError
 from .events import log_event
+from .memory import estimate_engine_memory
 from .models import ENGINE_INT_MAX, FieldSource, invalid, issue, resolve
 from .nowcasts import Nowcasts, probe_periodic
 from .render import encode, export_name
@@ -35,6 +37,7 @@ async def finish_thread(function, *args):
 
 ACTIVE = timedelta(days=7)
 LIFETIME = timedelta(days=37)
+SKY_WIND_COMPONENTS = 2
 
 
 def utcnow():
@@ -144,6 +147,7 @@ class RunManager:
             if upgrade_uploads:
                 marker.touch()
             self.runs.load()
+            memory_capacity = self.settings.engine_memory_capacity()
             for run in sorted(self.runs.records.values(), key=lambda r: r["_order"]):
                 request = run["request"]
                 if "units" not in request or "name" not in run:
@@ -155,8 +159,31 @@ class RunManager:
                         _source_units=self.source_units(request, field),
                         request={"units": models.Units.grid().model_dump(), **request},
                     )
-                run["resolved"].setdefault("nz", 1)
-                run["resolved"].setdefault("dz", 1.0)
+                resolved = run["resolved"]
+                resolved.setdefault("nz", 1)
+                resolved.setdefault("dz", 1.0)
+                if "processes" not in resolved:
+                    resolved["processes"] = request.get(
+                        "processes"
+                    ) or models.automatic_processes(
+                        resolved["nx"],
+                        resolved["ny"],
+                        resolved["nz"],
+                        self.settings.cpu_count,
+                    )
+                if "estimated_memory_bytes" not in resolved:
+                    resolved["estimated_memory_bytes"] = estimate_engine_memory(
+                        resolved["nx"],
+                        resolved["ny"],
+                        resolved["nz"],
+                        resolved["processes"],
+                        (
+                            SKY_WIND_COMPONENTS
+                            if run.get("_wind_limit") is not None
+                            else 0
+                        ),
+                    )
+                resolved.setdefault("memory_capacity_bytes", memory_capacity)
                 self.sequence = max(run["_order"], self.sequence)
                 directory = self.runs.root / run["id"]
                 for partial in directory.glob("export-*.partial.*"):
@@ -361,7 +388,7 @@ class RunManager:
             self.field_path(item), item, var, index, window, self.disk
         )
 
-    def assess(self, req, validate):
+    def assess(self, req, validate, wind_limit=None):
         src = req.source
         item = None
         if isinstance(src, FieldSource):
@@ -386,8 +413,14 @@ class RunManager:
             self.disk.available,
             nz,
             (var.get("units") or "1") if item else "1",
+            wind_components=SKY_WIND_COMPONENTS if wind_limit is not None else 0,
         )
-        if validate and item is not None:
+        resolved = report["resolved"]
+        memory_exceeded = (
+            resolved is not None
+            and resolved["estimated_memory_bytes"] > resolved["memory_capacity_bytes"]
+        )
+        if validate and item is not None and not memory_exceeded:
             try:
                 netcdf.prepare_input(self.field_path(item), item, src, self.disk)
             except HTTPException as exc:
@@ -409,7 +442,9 @@ class RunManager:
         self, req, validate=False, wind_limit=None, identifier=None
     ):
         try:
-            report, item = await asyncio.to_thread(self.assess, req, validate)
+            report, item = await asyncio.to_thread(
+                self.assess, req, validate, wind_limit
+            )
         except DiskSpaceError as exc:
             if not validate:
                 raise invalid("source", str(exc)) from exc
@@ -654,7 +689,11 @@ class RunManager:
                 self.nowcasts.notify()
                 if run.get("_wind_limit") is not None and not self.nowcasts.supported:
                     return run, self.nowcasts.probe_message
+                # Lower CPU priority so the API (History, progress polling) stays
+                # responsive while the engine uses every core.
+                nice = shutil.which("nice") if self.settings.engine_nice else None
                 args = [
+                    *([nice, "-n", str(self.settings.engine_nice)] if nice else []),
                     self.settings.mpirun,
                     *self.settings.mpi_args,
                     "-np",
@@ -691,6 +730,7 @@ class RunManager:
                     return run, await self.engine_message(run, directory, code)
 
     async def engine_message(self, run, directory, code):
+        message = None
         try:
             info = await self.refresh(run, strict=True)
             if (
@@ -700,15 +740,26 @@ class RunManager:
             ):
                 await self.annotate_result(run)
                 return None
-            if info.get("message"):
-                return info["message"]
-            message = f"Engine exited with code {code} without completing output"
-            with (directory / "engine.log").open("rb") as log:
-                log.seek(max(0, log.seek(0, os.SEEK_END) - 2048))
-                tail = log.read().decode(errors="replace").strip()
-            return f"{message}\n{tail}" if tail else message
+            message = info.get("message")
         except (OSError, RuntimeError, ValueError, IndexError, KeyError) as exc:
-            return f"Cannot read engine output: {exc}"
+            if not code:
+                message = f"Cannot read engine output: {exc}"
+
+        output = ""
+        with suppress(OSError):
+            output = (directory / "engine.log").read_text(errors="replace")
+        if code in (-signal.SIGKILL, 128 + signal.SIGKILL) or re.search(
+            r"\b(?:sigkill|signal\s+9)\b", f"{message or ''}\n{output}", re.IGNORECASE
+        ):
+            message = "The engine ran out of memory and was stopped by the system."
+        elif not message:
+            message = (
+                f"The engine stopped with exit code {code}."
+                if code
+                else "Engine exited with code 0 without completing output"
+            )
+        details = (line for line in output.splitlines() if line.strip().strip("-"))
+        return "\n".join((message, *details))
 
     async def annotate_result(self, run):
         field = self.fields.records.get(run["request"]["source"].get("field_id"))

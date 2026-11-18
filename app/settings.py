@@ -6,6 +6,8 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from .memory import DEFAULT_ENGINE_MEMORY_RESERVE_BYTES, engine_memory_capacity
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -19,6 +21,9 @@ class Settings:
     disk_margin_bytes: int = 2 * 1024**3
     preview_memory_bytes: int = 256 * 1024**2
     native_image_ram_fraction: float = 0.25
+    engine_memory_reserve_bytes: int = DEFAULT_ENGINE_MEMORY_RESERVE_BYTES
+    engine_memory_bytes: int | None = None
+    engine_nice: int = 10
 
     @classmethod
     def from_env(cls):
@@ -41,6 +46,20 @@ class Settings:
         native_fraction = float(os.getenv("NATIVE_IMAGE_RAM_FRACTION", "0.25"))
         if not 0 < native_fraction <= 1:
             raise ValueError("NATIVE_IMAGE_RAM_FRACTION must be in (0, 1]")
+        memory_reserve = int(
+            os.getenv(
+                "ENGINE_MEMORY_RESERVE_BYTES", str(DEFAULT_ENGINE_MEMORY_RESERVE_BYTES)
+            )
+        )
+        if memory_reserve < 0:
+            raise ValueError("ENGINE_MEMORY_RESERVE_BYTES must be nonnegative")
+        engine_nice = int(os.getenv("ENGINE_NICE", "10"))
+        if not 0 <= engine_nice <= 19:
+            raise ValueError("ENGINE_NICE must be in 0..19")
+        memory_override = os.getenv("ENGINE_MEMORY_BYTES")
+        memory_bytes = int(memory_override) if memory_override else None
+        if memory_bytes is not None and memory_bytes < 0:
+            raise ValueError("ENGINE_MEMORY_BYTES must be nonnegative")
         return cls(
             Path(os.getenv("DATA_DIR", "data")).expanduser().resolve(),
             str(Path(executable).resolve()) if executable else engine,
@@ -56,6 +75,14 @@ class Settings:
             disk_margin,
             preview_memory,
             native_fraction,
+            memory_reserve,
+            memory_bytes,
+            engine_nice,
+        )
+
+    def engine_memory_capacity(self) -> int:
+        return engine_memory_capacity(
+            self.engine_memory_reserve_bytes, self.engine_memory_bytes
         )
 
     def engine_description(self):

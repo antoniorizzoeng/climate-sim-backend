@@ -5,7 +5,7 @@
 [![CI status](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/ci.yml)
 [![CodeQL status](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/codeql.yml/badge.svg)](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/codeql.yml)
 [![License AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-52475e)](LICENSE)
-[![API version 1.5.0](https://img.shields.io/badge/API-1.5.0-9c523c)](api/openapi.yaml)
+[![API version 1.6.0](https://img.shields.io/badge/API-1.6.0-9c523c)](api/openapi.yaml)
 
 <p align="center">
   <img src="docs/assets/braid-projection.gif" width="820" alt="Three gold and violet tracer filaments travel across a periodic volume, seen in maximum projection."/>
@@ -123,11 +123,15 @@ List responses include `total` and `total_bytes` across all matching pages. Reus
 | `MPIRUN` · `MPIRUN_ARGS` | `mpirun` · empty | Launcher and extra arguments. Compose enables oversubscription. |
 | `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated list of permitted browser origins. |
 | `DISK_SAFETY_MARGIN_BYTES` | `2147483648` | Free space reserved on the data filesystem. |
+| `ENGINE_MEMORY_RESERVE_BYTES` | `536870912` (512 MiB) | RAM reserved for the backend and other processes. |
+| `ENGINE_MEMORY_BYTES` | Calculated | Overrides the final RAM budget for the engine in bytes. |
 | `PREVIEW_MEMORY_BYTES` | `268435456` (256 MiB) | Per-request working memory allowance for downscaled field preview and frame PNGs. |
 | `NATIVE_IMAGE_RAM_FRACTION` | `0.25` | Fraction of currently available RAM a native PNG can use, in (0, 1]. |
 | `ENGINE_PERIODIC` | `1` | Advertise wrapping when the engine passes its periodic-boundary probe. |
 
 Both PNG endpoints return HTTP 413 when the request exceeds the applicable memory allowance. Native PNGs (including requests whose `max_side` leaves the dimensions unchanged) estimate 64 bytes per source cell for decoding and rendering, with additional space for NetCDF chunks. Available RAM accounts for cgroup v2 limits on Linux. Request a smaller `max_side` to use strip-based rendering. Downscaled requests must fit the output, one source row, and any required NetCDF chunk within the preview budget.
+
+Run validation reports peak engine RAM and the server's budget in the resolved settings. Runs over budget are rejected before entering the queue. [Engine memory model and measurements](docs/performance.md#engine-memory)
 
 The Docker build fetches engine `main`. If Sky reports that the engine ignores `wind.mode=file`, a cached build layer may contain an older executable. Set the Docker build argument `ENGINE_REF` to the current engine commit and rebuild the API image. The engine health response includes a binary fingerprint.
 
