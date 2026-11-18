@@ -9,7 +9,6 @@ from contextlib import ExitStack, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
-import numpy as np
 import psutil
 import yaml
 from fastapi import HTTPException
@@ -19,7 +18,7 @@ from .disk import DiskBudget, DiskSpaceError
 from .events import log_event
 from .models import ENGINE_INT_MAX, FieldSource, invalid, issue, resolve
 from .nowcasts import Nowcasts, probe_periodic
-from .render import display_range, encode, export_name
+from .render import encode, export_name
 from .sky import wind_config
 from .storage import Collection
 
@@ -116,8 +115,16 @@ class RunManager:
         try:
             fcntl.flock(self.owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.fields.load()
+            for field in self.fields.records.values():
+                if any("nz" not in var for var in field["variables"]):
+                    await asyncio.to_thread(
+                        netcdf.upgrade_field, self.field_path(field), field
+                    )
+                    self.fields.update(field, variables=field["variables"])
             self.runs.load()
             for run in sorted(self.runs.records.values(), key=lambda r: r["_order"]):
+                run["resolved"].setdefault("nz", 1)
+                run["resolved"].setdefault("dz", 1.0)
                 self.sequence = max(run["_order"], self.sequence)
                 directory = self.runs.root / run["id"]
                 for partial in directory.glob("export-*.partial.*"):
@@ -275,40 +282,35 @@ class RunManager:
 
     def assess(self, req, validate):
         src = req.source
-        plane = item = None
+        item = None
         if isinstance(src, FieldSource):
             item = lookup(self.fields, src.field_id)
-            var, _ = netcdf.selected_indices(item, src.var, src.index)
+            var, _ = netcdf.selected_indices(
+                item, src.var, src.index, volume=src.volume
+            )
             nx, ny = var["nx"], var["ny"]
+            layers = var["nz"] if src.volume else 1
+            if layers > 1 and src.replicate_z > 1:
+                raise invalid(
+                    "source.replicate_z", "Only a selected plane can be replicated"
+                )
+            nz = max(layers, src.replicate_z)
         else:
-            nx, ny = src.nx, src.ny
-        report = resolve(req, nx, ny, self.settings, self.disk.available)
+            nx, ny, nz = src.nx, src.ny, src.nz
+        report = resolve(req, nx, ny, self.settings, self.disk.available, nz)
+        if validate and item is not None:
+            try:
+                netcdf.prepare_input(self.field_path(item), item, src, self.disk)
+            except HTTPException as exc:
+                report.update(ok=False, resolved=None)
+                report["errors"].extend(exc.detail)
         if not validate and report["ok"]:
             self.disk.check(
                 report["resolved"]["estimated_output_bytes"]
-                + models.initial_bytes(req, nx, ny),
+                + models.initial_bytes(src, nx, ny, nz),
                 "simulation output and staged input",
             )
-        if item is not None:
-            if validate:
-                summary = netcdf.field_stats(
-                    self.field_path(item), item, src.var, src.index, self.disk
-                )
-                missing = src.fill_value is None and summary["missing_count"]
-            elif report["ok"]:
-                plane, _ = self.field_plane(item, src.var, src.index)
-                mask = ~np.isfinite(plane)
-                missing = src.fill_value is None and mask.any()
-                if src.fill_value is not None:
-                    plane[mask] = src.fill_value
-            else:
-                missing = False
-            if missing:
-                report.update(ok=False, resolved=None)
-                report["errors"].append(
-                    issue("source.fill_value", "Selected plane contains missing cells")
-                )
-        return report, plane
+        return report, item
 
     async def submit(self, req, validate=False, wind_limit=None):
         async with self.lock:
@@ -318,7 +320,7 @@ class RunManager:
         self, req, validate=False, wind_limit=None, identifier=None
     ):
         try:
-            report, plane = await asyncio.to_thread(self.assess, req, validate)
+            report, item = await asyncio.to_thread(self.assess, req, validate)
         except DiskSpaceError as exc:
             if not validate:
                 raise invalid("source", str(exc)) from exc
@@ -342,20 +344,22 @@ class RunManager:
         if not report["ok"]:
             raise HTTPException(422, report["errors"])
         resolved = report["resolved"]
-        input_size = models.initial_bytes(req, resolved["nx"], resolved["ny"])
         with self.runs.staging(identifier) as (identifier, staging):
             directory = self.runs.root / identifier
-            if plane is None:
+            if item is None:
                 ic = {"mode": "preset", "preset": req.source.preset}
             else:
                 path = staging / "input.nc"
 
-                def write_input():
-                    with self.disk.reserve(input_size, "staged input", path):
-                        netcdf.write_plane(path, plane)
-
                 try:
-                    await finish_thread(write_input)
+                    await finish_thread(
+                        netcdf.prepare_input,
+                        self.field_path(item),
+                        item,
+                        req.source,
+                        self.disk,
+                        path,
+                    )
                 except DiskSpaceError as exc:
                     raise invalid("source", str(exc)) from exc
                 ic = {
@@ -363,10 +367,12 @@ class RunManager:
                     "var": "u",
                     "path": str(directory / "input.nc"),
                 }
+                if req.source.replicate_z > 1:
+                    ic["replicate_z"] = True
             config = dict(
                 grid=dict(nx=resolved["nx"], ny=resolved["ny"], dx=req.dx, dy=req.dy),
                 physics=dict(D=req.D, vx=req.vx, vy=req.vy),
-                bc=req.bc.model_dump(),
+                bc=req.bc.model_dump(exclude={"front", "back"}),
                 ic=ic,
                 time=dict(
                     dt=req.dt,
@@ -374,6 +380,10 @@ class RunManager:
                     out_every=min(ENGINE_INT_MAX, resolved["out_every"]),
                 ),
             )
+            if resolved["nz"] > 1:
+                config["grid"].update(nz=resolved["nz"], dz=req.dz)
+                config["physics"].update(Dz=req.Dz, vz=req.vz)
+                config["bc"].update(front=req.bc.front, back=req.bc.back)
             if wind_limit is not None:
                 if not self.nowcasts.supported:
                     raise invalid("source", self.nowcasts.probe_message)
@@ -435,7 +445,7 @@ class RunManager:
                         )
                     if not run["frames"]:
                         run["display_range"] = await asyncio.to_thread(
-                            display_range, output, run["request"].get("bc", {})
+                            netcdf.initial_range, output, run["request"].get("bc", {})
                         )
                 run.update({k: info[k] for k in ("step", "time", "frames")})
         except (OSError, RuntimeError, ValueError, IndexError, KeyError):
@@ -614,9 +624,11 @@ class RunManager:
         async with self.export_slot:
             await finish_thread(encode, *args)
 
-    def export(self, run, fmt, fps, style):
+    def export(self, run, fmt, fps, style, view):
         directory = self.runs.root / run["id"]
-        target = directory / export_name(fmt, fps, style)
+        grid = run["resolved"]
+        view = view.resolve((grid["nz"], grid["ny"], grid["nx"]))
+        target = directory / export_name(fmt, fps, style, view)
         job = self.exports.get(target)
         if job and job.task.done():
             del self.exports[target]
@@ -638,6 +650,7 @@ class RunManager:
                     cancel,
                     fraction,
                     self.disk,
+                    view,
                 )
             )
             self.exports[target] = ExportJob(task, cancel, fraction)

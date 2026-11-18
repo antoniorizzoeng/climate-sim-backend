@@ -28,7 +28,7 @@ def create_app(settings=None, clock=utcnow):
         finally:
             await manager.close()
 
-    api = FastAPI(title="climate-sim API", version="1.2.0", lifespan=lifespan)
+    api = FastAPI(title="climate-sim API", version="1.3.0", lifespan=lifespan)
     api.include_router(router)
     api.add_middleware(
         CORSMiddleware,
@@ -38,6 +38,7 @@ def create_app(settings=None, clock=utcnow):
         expose_headers=[
             "X-Nx",
             "X-Ny",
+            "X-Nz",
             "X-I0",
             "X-J0",
             "X-Stride",

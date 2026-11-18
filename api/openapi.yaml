@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: climate-sim API
-  version: 1.2.0
+  version: 1.3.0
   description: |
     Backend for the climate-sim frontend. Runs the MPI engine (climate-sim-mpi-cpp) locally with mpirun.
     Single local user, no authentication. One run executes at a time (all cores); others wait in a FIFO queue.
@@ -17,12 +17,20 @@ info:
 
     ## Stability (explicit upwind advection + FTCS diffusion share one timestep)
     dt_max = 1 / (|vx|/dx + |vy|/dy + 2·D·(1/dx² + 1/dy²)); null when the denominator is 0 (any dt is stable).
+    For nz > 1, dt_max = 1 / (|vx|/dx + |vy|/dy + |vz|/dz + 2·(D/dx² + D/dy² + Dz/dz²)).
+    Dz defaults to D. A zero denominator again yields null. For nz = 1 the z terms are ignored.
     POST /runs returns 422 when dt > dt_max. The frontend computes the same formula live and clamps.
 
     ## Boundary conditions
     UI labels: dirichlet = "fixed (value 0 outside)", neumann = "insulated (zero gradient)", periodic = "wrap-around".
     periodic must be set on both opposite edges of an axis. The backend only offers what the installed engine
     supports (ServerConfig.supported_boundary_conditions). A startup probe verifies periodic wrap-around.
+
+    ## Volume playback
+    For nz > 1 the output variable is u(time, z, y, x). A z view returns rows and columns (y, x),
+    a y view (z, x), and an x view (z, y). Row zero is first in raw data and at the bottom of an image.
+    Windows and X-Nx/X-Ny refer to the displayed columns and rows. Slices and projections share the run colour range.
+    For nz = 1, axis, slice and projection are accepted and ignored.
 
     ## Timeline
     out_every is either given or derived from `frames` (K ≥ 2): out_every = ceil(steps / (K − 1)).
@@ -36,6 +44,12 @@ info:
     coordinate. _FillValue / missing_value are masked (compared in stored units), then scale_factor / add_offset are
     applied once; values are kept as float64 for simulation. Non-finite or masked cells are "missing".
     The selected plane is written as a 2-D CDF-5 double variable "u" in the run directory and passed as ic.var=u.
+
+    With FieldSource.volume enabled, a vertical dimension immediately before (y, x) supplies all z layers.
+    It is recognized by its case-insensitive name (z, nz, depth, height, altitude, level, lev, layer, plev, pressure,
+    isobaricInhPa, isobaricInPa) or its coordinate metadata (axis Z, positive up/down, or standard_name
+    depth, height, altitude, air_pressure). Other extra dimensions retain their selected indices. The whole-volume
+    selection ignores the z index and reverses descending z coordinates. Missing-cell rules apply across all layers.
 
     ## Retention (product decision)
     - A field is ACTIVE for 7 days after its last use (creation or a run started from it), then ARCHIVED for 30 days:
@@ -326,6 +340,9 @@ paths:
     get:
       operationId: getFramePng
       parameters:
+        - { $ref: "#/components/parameters/Axis" }
+        - { $ref: "#/components/parameters/Slice" }
+        - { $ref: "#/components/parameters/Projection" }
         - { $ref: "#/components/parameters/Colormap" }
         - { $ref: "#/components/parameters/Vmin" }
         - { $ref: "#/components/parameters/Vmax" }
@@ -345,6 +362,9 @@ paths:
     get:
       operationId: getFrameValues
       parameters:
+        - { $ref: "#/components/parameters/Axis" }
+        - { $ref: "#/components/parameters/Slice" }
+        - { $ref: "#/components/parameters/Projection" }
         - { $ref: "#/components/parameters/I0" }
         - { $ref: "#/components/parameters/J0" }
         - { $ref: "#/components/parameters/W" }
@@ -352,6 +372,32 @@ paths:
         - { $ref: "#/components/parameters/Stride" }
       responses:
         "200": { $ref: "#/components/responses/Float32Grid" }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "409": { $ref: "#/components/responses/MessageError" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /runs/{runId}/frames/{n}/volume:
+    parameters:
+      - { $ref: "#/components/parameters/RunId" }
+      - { $ref: "#/components/parameters/FrameIndex" }
+    get:
+      operationId: getFrameVolume
+      summary: Sample one frame for client-side 3D rendering.
+      parameters:
+        - name: max_side
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 128, default: 64 }
+      responses:
+        "200":
+          description: >
+            Little-endian float32 in row-major [z, y, x] order, x fastest. All axes start at zero and use
+            stride ceil(max(nx, ny, nz) / max_side). The headers give the sampled dimensions.
+            A single-layer run has X-Nz = 1.
+          headers:
+            X-Nx: { schema: { type: integer } }
+            X-Ny: { schema: { type: integer } }
+            X-Nz: { schema: { type: integer } }
+          content: { application/octet-stream: {} }
         "404": { $ref: "#/components/responses/MessageError" }
         "409": { $ref: "#/components/responses/MessageError" }
         "422": { $ref: "#/components/responses/ValidationError" }
@@ -369,6 +415,9 @@ paths:
         Animation of all frames, rendered frame by frame into ffmpeg in a background worker (identical requests are
         coalesced and cached). Returns 202 with Retry-After until ready, then 200 with the file. Only when status is done.
       parameters:
+        - { $ref: "#/components/parameters/Axis" }
+        - { $ref: "#/components/parameters/Slice" }
+        - { $ref: "#/components/parameters/Projection" }
         - name: fps
           in: query
           schema: { type: integer, minimum: 1, maximum: 60, default: 12 }
@@ -402,7 +451,7 @@ paths:
     parameters: [{ $ref: "#/components/parameters/RunId" }]
     get:
       operationId: downloadResult
-      summary: Raw engine output (CDF-5, u(time, y, x)). Only when status is done.
+      summary: Raw engine output (CDF-5, u(time, y, x) or u(time, z, y, x)). Only when status is done.
       responses:
         "200":
           description: File download
@@ -479,6 +528,9 @@ components:
     NowcastId: { name: id, in: path, required: true, schema: { type: string } }
     FieldId: { name: fieldId, in: path, required: true, schema: { type: string } }
     RunId: { name: runId, in: path, required: true, schema: { type: string } }
+    Axis: { name: axis, in: query, description: Axis perpendicular to the view, schema: { type: string, enum: [z, y, x], default: z } }
+    Slice: { name: slice, in: query, description: "Zero-based layer along axis, default floor(axis length / 2). Ignored for projections.", schema: { type: integer, minimum: 0 } }
+    Projection: { name: projection, in: query, description: Reduce along the selected axis, schema: { type: string, enum: [none, max, mean], default: none } }
     FrameIndex: { name: n, in: path, required: true, schema: { type: integer, minimum: 0 } }
     Var:
       name: var
@@ -606,11 +658,13 @@ components:
     Variable:
       type: object
       additionalProperties: false
-      required: [name, nx, ny, extra_dims]
+      required: [name, nx, ny, nz, extra_dims]
       properties:
         name: { type: string }
         nx: { type: integer }
         ny: { type: integer }
+        nz: { type: integer, description: Size of the vertical dimension or 1 when absent }
+        z_dim: { type: string, description: Name of the vertical dimension when present }
         extra_dims: { type: array, items: { $ref: "#/components/schemas/ExtraDim" } }
         units: { type: [string, "null"] }
         long_name: { type: [string, "null"] }
@@ -655,9 +709,11 @@ components:
         field_id: { type: string }
         var: { type: string, description: Defaults to Field.default_var }
         index: { type: object, additionalProperties: { type: integer, minimum: 0 }, description: Extra-dimension indices (default 0) }
+        volume: { type: boolean, default: false, description: Select all layers when the third-to-last dimension is vertical. Otherwise use the selected plane. }
+        replicate_z: { type: integer, minimum: 1, default: 1, description: Number of layers to initialize from a selected plane (including a drawing). Applies to planes only. }
         fill_value:
           type: [number, "null"]
-          description: Replaces missing cells. Required (422 otherwise) when the selected plane has missing cells.
+          description: Replaces missing cells. Required (422 otherwise) when the selected plane or volume has missing cells.
 
     PresetSource:
       type: object
@@ -668,6 +724,7 @@ components:
         preset: { $ref: "#/components/schemas/Preset" }
         nx: { type: integer, minimum: 4 }
         ny: { type: integer, minimum: 4 }
+        nz: { type: integer, minimum: 1, default: 1 }
 
     RunSource:
       oneOf:
@@ -687,6 +744,8 @@ components:
         right: { $ref: "#/components/schemas/BoundaryCondition" }
         bottom: { $ref: "#/components/schemas/BoundaryCondition" }
         top: { $ref: "#/components/schemas/BoundaryCondition" }
+        front: { $ref: "#/components/schemas/BoundaryCondition" }
+        back: { $ref: "#/components/schemas/BoundaryCondition" }
       description: Each edge defaults to dirichlet.
 
     RunRequest:
@@ -697,6 +756,9 @@ components:
         source: { $ref: "#/components/schemas/RunSource" }
         dx: { type: number, exclusiveMinimum: 0, default: 1.0 }
         dy: { type: number, exclusiveMinimum: 0, default: 1.0 }
+        dz: { type: number, exclusiveMinimum: 0, default: 1.0 }
+        Dz: { type: number, minimum: 0, description: Vertical diffusion coefficient. Defaults to D. }
+        vz: { type: number, default: 0.0 }
         D: { type: number, minimum: 0, default: 0.0, description: Diffusion coefficient }
         vx: { type: number, default: 0.0 }
         vy: { type: number, default: 0.0 }
@@ -710,22 +772,25 @@ components:
           minimum: 1
           description: >
             MPI ranks. Omitted → default_processes, automatically reduced so the MPI_Dims_create grid fits nx and ny.
+            For volumes, all ranks must fit a Cartesian factorization across nx, ny and nz.
             An explicit value that does not fit, or exceeds cpu_count, is rejected.
 
     ResolvedRun:
       type: object
       additionalProperties: false
-      required: [nx, ny, dt, steps, out_every, expected_frames, processes, dt_max, estimated_output_bytes]
+      required: [nx, ny, nz, dz, dt, steps, out_every, expected_frames, processes, dt_max, estimated_output_bytes]
       properties:
         nx: { type: integer }
         ny: { type: integer }
+        nz: { type: integer, minimum: 1 }
+        dz: { type: number, exclusiveMinimum: 0 }
         dt: { type: number }
         steps: { type: integer }
         out_every: { type: integer }
         expected_frames: { type: integer }
         processes: { type: integer }
         dt_max: { type: [number, "null"] }
-        estimated_output_bytes: { type: integer, description: "≈ 8·nx·ny·expected_frames + header" }
+        estimated_output_bytes: { type: integer, description: "≈ 8·nx·ny·nz·expected_frames + header" }
 
     RunValidation:
       type: object

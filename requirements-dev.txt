@@ -5,3 +5,4 @@ flake8==7.1.0
 black==25.11.0
 isort==6.0.0
 jsonschema
+openapi-spec-validator>=0.7,<1
