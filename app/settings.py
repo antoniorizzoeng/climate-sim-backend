@@ -43,7 +43,7 @@ class Settings:
                 for x in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
                 if x.strip()
             ),
-            os.getenv("ENGINE_PERIODIC") == "1",
+            os.getenv("ENGINE_PERIODIC", "1") == "1",
             cpu_count or 1,
             disk_margin,
         )

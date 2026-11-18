@@ -1,10 +1,13 @@
 from dataclasses import replace
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from app import nowcasts
 from app.main import create_app
 from app.models import RunRequest, fits, resolve
+from app.settings import Settings
 from tests.conftest import preset
 
 
@@ -88,7 +91,18 @@ def test_semantic_errors(client, changes):
     )
 
 
-def test_periodic_enabled(settings):
+def test_periodic_enabled(settings, monkeypatch):
+    frame = np.zeros((5, 5))
+    frame[-1, 0] = frame[0, -1] = 0.25
+
+    def probe_frame(settings, plane, bc, **physics):
+        if physics.get("wind") is not None:
+            raise OSError("file wind unsupported")
+        assert set(bc.values()) == {"periodic"}
+        assert physics == dict(vx=0.25, vy=0.25)
+        return frame
+
+    monkeypatch.setattr(nowcasts, "probe_frame", probe_frame)
     with TestClient(create_app(replace(settings, periodic=True))) as client:
         assert (
             "periodic" in client.get("/config").json()["supported_boundary_conditions"]
@@ -98,6 +112,28 @@ def test_periodic_enabled(settings):
             assert client.post("/runs/validate", json=preset(bc=bc)).json()["ok"]
             del bc[axis[1]]
             assert not client.post("/runs/validate", json=preset(bc=bc)).json()["ok"]
+
+
+@pytest.mark.parametrize("silently_ignored", [True, False])
+def test_periodic_default_falls_back_for_old_engine(
+    settings, monkeypatch, silently_ignored
+):
+    monkeypatch.delenv("ENGINE_PERIODIC", raising=False)
+    assert Settings.from_env().periodic
+
+    def probe_frame(settings, plane, bc, **physics):
+        if silently_ignored:
+            return plane
+        raise OSError("periodic unsupported")
+
+    monkeypatch.setattr(nowcasts, "probe_frame", probe_frame)
+    with TestClient(create_app(replace(settings, periodic=True))) as client:
+        assert client.get("/config").json()["supported_boundary_conditions"] == [
+            "dirichlet",
+            "neumann",
+        ]
+        req = preset(bc=dict(left="periodic", right="periodic"))
+        assert not client.post("/runs/validate", json=req).json()["ok"]
 
 
 def test_mpi_dims_and_disk_warning(settings):

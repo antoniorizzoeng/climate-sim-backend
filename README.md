@@ -35,7 +35,7 @@ Open http://localhost:8000/docs. The image builds the simulator from the engine 
 | MPIRUN_ARGS | empty | Additional shell-quoted launcher arguments, e.g. --oversubscribe. Compose defaults to --oversubscribe. |
 | CORS_ORIGINS | http://localhost:3000 | Comma-separated browser origins. |
 | DISK_SAFETY_MARGIN_BYTES | 2147483648 (2 GiB) | Free space to keep on the data filesystem. |
-| ENGINE_PERIODIC | 0 | Set to 1 when the installed engine supports periodic boundary conditions. |
+| ENGINE_PERIODIC | 1 | Advertise periodic boundaries when the installed engine passes the startup wrap-around probe. Set to 0 to disable them. |
 
 The service logs one JSON line per request and simulation state change. `GET /health` reports `X-Queue-Length`, `X-Active-Run-Id` (empty when idle), and `X-Disk-Free-Bytes` in response headers.
 
@@ -73,4 +73,18 @@ Open-Meteo supplies the initial cloud cover and hourly winds. Only the site and 
 
 Weather samples span the outer simulation cell centres on an odd regular grid capped at 17 × 17. Sample spacing is about 37 km at the default radius and 125 km at the largest radius. Bilinear interpolation supplies the engine grid. Row zero is south. Low, mid and high clouds follow winds at 850, 500 and 300 hPa, respectively. Meteorological “from” directions become east/north velocities in m/s (1 m/s = 3.6 km/h). Each layer uses zero-gradient boundaries, diffusion of 10 m²/s and a timestep at most 90% of the combined advection–diffusion stability limit. Frames are ten minutes apart.
 
-The timeline compares transported cloud fractions (random overlap for total) with Open-Meteo’s own site forecast, interpolated hourly totals included. Clear fraction estimates unobscured sky area. The hourly 250 hPa wind gives a seeing rule of thumb (good below 20 m/s, fair from 20 through 35, poor above 35). Local turbulence can dominate. Transport is most useful for a few hours. Clouds can form, dissipate or change altitude, and incoming clouds beyond the grid are unknown. Increasing the simulation resolution adds no weather observations. A startup probe checks engine wind-file support before any forecast is fetched.
+The timeline contains the transported cloud fractions (`nowcast`), Open-Meteo's site forecast interpolated from hourly values (`model`), and their `blend`. Transport omits cloud formation, dissipation and vertical motion, and clouds arriving from beyond the grid are unknown. The blend starts at 100% transport and increases the model's share with lead time. For each layer and for total cloud cover, the transport weight is `exp(-t / τ)`, where `t` is hours since `data_time`. Pass a positive `blend_tau_hours` in the request to change τ. The default is 2 hours, when transport contributes about 37%. The transport total uses random overlap and the model total comes from Open-Meteo. Blended clear is one minus blended total. A startup probe checks engine wind-file support before any forecast is fetched.
+
+The hourly 250 hPa wind gives a seeing rule of thumb (good below 20 m/s, fair from 20 through 35, poor above 35). Local turbulence can dominate. `best_window` reports the longest stretch of consecutive samples with at least 70% blended clear sky and good or fair seeing. It includes the first and last qualifying timestamps, mean clear fraction, and worst seeing category in the stretch. Ties favor the earliest stretch. If no sample qualifies, the window is null.
+
+On startup, the backend fills in the default τ, blend and best window for older saved nowcasts using their stored site data.
+
+### Check a saved nowcast
+
+Once the final reference hour is past, run the following from the repository root with either a saved `GET /nowcasts/{id}` response or the nowcast's `DATA_DIR/nowcasts/{id}/metadata.json`.
+
+```bash
+python -m scripts.nowcast_skill path/to/nowcast.json
+```
+
+The script makes one Open-Meteo request for hourly low, mid, high, and total cloud cover at the site. It uses `past_hours` for the last 24 hours and `past_days` for older records within the API's 92-day limit. The past hours reflect the latest model initialization available for each valid hour and serve as a proxy for actual conditions. Give the provider time to ingest a newer model run before evaluating. The script interpolates between adjacent reference hours to align with the ten-minute site samples and reports mean absolute error in percentage points for each series. All three scores use the same matched samples, and the output shows how many matched. [Open-Meteo Forecast API](https://open-meteo.com/en/docs)

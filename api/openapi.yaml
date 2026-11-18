@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: climate-sim API
-  version: 1.1.0
+  version: 1.2.0
   description: |
     Backend for the climate-sim frontend. Runs the MPI engine (climate-sim-mpi-cpp) locally with mpirun.
     Single local user, no authentication. One run executes at a time (all cores); others wait in a FIFO queue.
@@ -22,7 +22,7 @@ info:
     ## Boundary conditions
     UI labels: dirichlet = "fixed (value 0 outside)", neumann = "insulated (zero gradient)", periodic = "wrap-around".
     periodic must be set on both opposite edges of an axis. The backend only offers what the installed engine
-    supports (ServerConfig.supported_boundary_conditions); periodic appears once engine issue #56 is fixed.
+    supports (ServerConfig.supported_boundary_conditions). A startup probe verifies periodic wrap-around.
 
     ## Timeline
     out_every is either given or derived from `frames` (K ≥ 2): out_every = ceil(steps / (K − 1)).
@@ -418,7 +418,10 @@ paths:
         Uses hourly Open-Meteo low, mid and high cloud cover and winds at 850, 500 and 300 hPa.
         Three FIFO runs transport the initial cloud layers on a local grid with zero-gradient edges.
         Transport omits cloud formation, dissipation and vertical motion. It is most useful for a few hours,
-        especially before air from outside the domain reaches the site. Grid footprints must stay short of the poles.
+        especially before air from outside the domain reaches the site. The blend starts with transport and gives
+        increasing weight to the Open-Meteo forecast as lead time grows. The transport weight is exp(−t/τ), where t
+        is hours from data_time and τ is blend_tau_hours. At t = τ, transport contributes about 37%.
+        Grid footprints must stay short of the poles.
         Coordinates of the site and surrounding grid are sent to Open-Meteo. A failed wind-file probe or
         unavailable forecast yields an error record with a diagnostic. Attribute model data to Open-Meteo.
       requestBody:
@@ -776,6 +779,11 @@ components:
         radius_km: { type: number, minimum: 50, maximum: 1000, default: 300, description: Half the width of the square domain. }
         hours: { type: integer, minimum: 1, maximum: 12, default: 6 }
         resolution: { type: integer, minimum: 16, maximum: 256, default: 96, description: Simulation cells per side. }
+        blend_tau_hours:
+          type: number
+          exclusiveMinimum: 0
+          default: 2
+          description: E-folding time in hours for the transport weight in the blend.
 
     CloudFraction:
       type: number
@@ -796,7 +804,7 @@ components:
     Nowcast:
       type: object
       additionalProperties: false
-      required: [id, status, created_at, params, data_time, layers, site, grid, message, expires_at]
+      required: [id, status, created_at, params, data_time, layers, site, best_window, grid, message, expires_at]
       properties:
         id: { type: string }
         status: { type: string, enum: [fetching, queued, running, done, error] }
@@ -819,13 +827,28 @@ components:
           items:
             type: object
             additionalProperties: false
-            required: [time, nowcast, model, jet_ms, seeing]
+            required: [time, nowcast, model, blend, jet_ms, seeing]
             properties:
               time: { type: string, format: date-time }
               nowcast: { $ref: "#/components/schemas/SkyCover", description: "Bilinear site samples. Total uses random overlap across layers." }
               model: { $ref: "#/components/schemas/SkyCover", description: "Open-Meteo site layers and its own total, linearly interpolated between UTC hours." }
+              blend:
+                $ref: "#/components/schemas/SkyCover"
+                description: Exponentially weighted transport and model values for each layer and for total. Clear is one minus blended total.
               jet_ms: { type: number, minimum: 0, description: Hourly 250 hPa wind speed in m/s held until the next hour. }
               seeing: { type: string, enum: [good, fair, poor], description: "Rule of thumb from jet_ms only. Good below 20, fair from 20 through 35, poor above 35." }
+        best_window:
+          type: [object, "null"]
+          additionalProperties: false
+          description: >
+            Longest stretch of consecutive ten-minute samples with blended clear fraction at least 0.70 and good
+            or fair seeing. Ties go to the earliest stretch. Null until done or when no sample qualifies.
+          required: [start, end, mean_clear, seeing]
+          properties:
+            start: { type: string, format: date-time, description: Time of the first qualifying sample. }
+            end: { type: string, format: date-time, description: Time of the last qualifying sample (inclusive). }
+            mean_clear: { $ref: "#/components/schemas/CloudFraction", description: Mean blended clear fraction across the stretch. }
+            seeing: { type: string, enum: [good, fair], description: Worst seeing category across the stretch. }
         grid:
           type: object
           additionalProperties: false

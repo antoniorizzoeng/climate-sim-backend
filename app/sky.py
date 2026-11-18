@@ -2,6 +2,8 @@
 
 import math
 from datetime import datetime, timedelta
+from itertools import groupby
+from statistics import mean
 
 import numpy as np
 
@@ -131,6 +133,40 @@ def seeing(speed):
     return "poor" if speed > 35 else "fair"
 
 
+def blend_site(rows, tau_hours):
+    if not rows:
+        return []
+    start = datetime.fromisoformat(rows[0]["time"])
+    blended = []
+    for row in rows:
+        lead_hours = (
+            datetime.fromisoformat(row["time"]) - start
+        ).total_seconds() / 3600
+        weight = math.exp(-lead_hours / tau_hours)
+        cloud = {
+            key: weight * row["nowcast"][key] + (1 - weight) * row["model"][key]
+            for key in (*LEVELS, "total")
+        }
+        blended.append(dict(row, blend=cover(**cloud)))
+    return blended
+
+
+def best_window(rows):
+    def qualifies(row):
+        return row["blend"]["clear"] >= 0.70 and row["seeing"] != "poor"
+
+    stretches = (list(group) for good, group in groupby(rows, qualifies) if good)
+    best = max(stretches, key=len, default=None)
+    if best is None:
+        return None
+    return dict(
+        start=best[0]["time"],
+        end=best[-1]["time"],
+        mean_clear=mean(row["blend"]["clear"] for row in best),
+        seeing="fair" if any(row["seeing"] == "fair" for row in best) else "good",
+    )
+
+
 def timeline(record, runs_dir):
     model = record["_model"]
     samples = {
@@ -156,4 +192,4 @@ def timeline(record, runs_dir):
                 seeing=seeing(jet),
             )
         )
-    return rows
+    return blend_site(rows, record["params"]["blend_tau_hours"])

@@ -1,10 +1,13 @@
 import asyncio
 import os
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
 
+from app.main import create_app
 from app.models import NowcastParams
 from app.open_meteo import ForecastClient
 from tests.conftest import eastward_bank, poll
@@ -13,8 +16,7 @@ from tests.conftest import eastward_bank, poll
 @pytest.mark.integration
 def test_eastward_cloud_bank(live, monkeypatch):
     service = live.app.state.manager.nowcasts
-    if not service.supported:
-        pytest.skip(service.probe_message)
+    assert service.supported, service.probe_message
 
     async def synthetic(params, start, fresh):
         return eastward_bank(params)
@@ -37,6 +39,18 @@ def test_eastward_cloud_bank(live, monkeypatch):
         live.get("/runs/" + result["layers"][0]["run_id"] + "/frames/6.png").status_code
         == 200
     )
+
+
+@pytest.mark.integration
+def test_periodic_startup_probe(engine_settings, clock):
+    with TestClient(
+        create_app(replace(engine_settings, periodic=True), clock)
+    ) as client:
+        assert client.get("/config").json()["supported_boundary_conditions"] == [
+            "dirichlet",
+            "neumann",
+            "periodic",
+        ]
 
 
 @pytest.mark.network

@@ -11,50 +11,62 @@ import numpy as np
 import yaml
 
 from . import netcdf, sky
-from .models import NowcastParams
+from .models import DEFAULT_BLEND_TAU_HOURS, NowcastParams
 from .open_meteo import ForecastClient
 from .storage import Collection
+
+PROBE_ERRORS = (OSError, subprocess.SubprocessError, RuntimeError, IndexError, KeyError)
+
+
+def probe_frame(settings, plane, bc, vx=0, vy=0, wind=None):
+    with TemporaryDirectory(dir=settings.data) as tmp:
+        directory = Path(tmp)
+        netcdf.write_plane(directory / "input.nc", plane)
+        config = dict(
+            grid=dict(nx=5, ny=5, dx=1, dy=1),
+            physics=dict(D=0, vx=vx, vy=vy),
+            ic=dict(mode="file", path="input.nc", var="u"),
+            bc=bc,
+            time=dict(dt=1, steps=1, out_every=1),
+        )
+        if wind is not None:
+            sky.write_wind(directory / "wind.nc", wind, wind * 0)
+            config["wind"] = sky.wind_config("wind.nc")
+        (directory / "probe.yaml").write_text(yaml.safe_dump(config))
+        subprocess.run(
+            [settings.engine, "--config=probe.yaml", "--output=result.nc"],
+            cwd=tmp,
+            timeout=10,
+            check=True,
+            capture_output=True,
+        )
+        return netcdf.read_frame(directory / "result.nc", 1)
 
 
 def probe_wind(settings):
     """Older engines silently accept unknown flags/YAML. Check a transported pulse."""
+    plane = np.zeros((5, 5))
+    plane[2, 1] = 1
     try:
-        with TemporaryDirectory(dir=settings.data) as tmp:
-            directory = Path(tmp)
-            plane = np.zeros((5, 5))
-            plane[2, 1] = 1
-            netcdf.write_plane(directory / "input.nc", plane)
-            wind = np.full((2, 5, 5), 0.5)
-            sky.write_wind(directory / "wind.nc", wind, wind * 0)
-            config = dict(
-                grid=dict(nx=5, ny=5, dx=1, dy=1),
-                physics=dict(D=0, vx=0, vy=0),
-                ic=dict(mode="file", path="input.nc", var="u"),
-                bc="neumann",
-                wind=sky.wind_config("wind.nc"),
-                time=dict(dt=1, steps=1, out_every=1),
-            )
-            (directory / "probe.yaml").write_text(yaml.safe_dump(config))
-            proc = subprocess.run(
-                [settings.engine, "--config=probe.yaml", "--output=result.nc"],
-                cwd=tmp,
-                timeout=10,
-                check=False,
-                capture_output=True,
-            )
-            if proc.returncode:
-                return f"wind.mode=file probe failed (engine exit {proc.returncode})"
-            if np.isclose(netcdf.read_frame(directory / "result.nc", 1)[2, 2], 0.5):
-                return None
-            return "Installed engine ignores wind.mode=file. Sky nowcasts require engine issue #58"
-    except (
-        OSError,
-        subprocess.TimeoutExpired,
-        RuntimeError,
-        IndexError,
-        KeyError,
-    ) as exc:
+        frame = probe_frame(settings, plane, "neumann", wind=np.full((2, 5, 5), 0.5))
+        if np.isclose(frame[2, 2], 0.5):
+            return None
+        return "Installed engine ignores wind.mode=file. Sky nowcasts require engine issue #58"
+    except subprocess.CalledProcessError as exc:
+        return f"wind.mode=file probe failed (engine exit {exc.returncode})"
+    except PROBE_ERRORS as exc:
         return f"Cannot verify engine wind.mode=file support: {exc}"
+
+
+def probe_periodic(settings):
+    plane = np.zeros((5, 5))
+    plane[-1, -1] = 1
+    edges = dict.fromkeys(("left", "right", "bottom", "top"), "periodic")
+    try:
+        frame = probe_frame(settings, plane, edges, vx=0.25, vy=0.25)
+        return bool(np.allclose([frame[-1, 0], frame[0, -1]], 0.25))
+    except PROBE_ERRORS:
+        return False
 
 
 class Nowcasts:
@@ -77,7 +89,10 @@ class Nowcasts:
         for record in list(self.records.records.values()):
             if record.get("_deleting"):
                 await self.delete(record)
-            elif record["status"] == "fetching":
+                continue
+            if "blend_tau_hours" not in record["params"]:
+                self.upgrade(record)
+            if record["status"] == "fetching":
                 await self.remove_children(record)
                 self.finish(
                     record,
@@ -85,6 +100,15 @@ class Nowcasts:
                 )
             elif record["status"] in ("queued", "running"):
                 self.launch(record)
+
+    def upgrade(self, record):
+        params = dict(record["params"], blend_tau_hours=DEFAULT_BLEND_TAU_HOURS)
+        site = record["site"]
+        if site is not None:
+            site = sky.blend_site(site, params["blend_tau_hours"])
+        self.records.update(
+            record, params=params, site=site, best_window=sky.best_window(site or ())
+        )
 
     async def close(self):
         tasks = list(self.tasks.values())
@@ -120,6 +144,7 @@ class Nowcasts:
                 layers=[],
                 grid=sky.grid(params),
                 site=None,
+                best_window=None,
                 message=self.probe_message,
                 expires_at=(now + self.retention).isoformat(),
             )
@@ -139,6 +164,7 @@ class Nowcasts:
             status="error" if message else "done",
             message=message,
             site=site,
+            best_window=sky.best_window(site or ()),
             expires_at=(self.manager.clock() + self.retention).isoformat(),
         )
 
