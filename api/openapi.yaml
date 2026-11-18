@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: climate-sim API
-  version: 1.3.1
+  version: 1.3.2
   description: |
     Backend for the climate-sim frontend. Runs the MPI engine (climate-sim-mpi-cpp) locally with mpirun.
     Single local user, no authentication. One run executes at a time (all cores); others wait in a FIFO queue.
@@ -214,6 +214,7 @@ paths:
           content: { image/png: {} }
         "404": { $ref: "#/components/responses/MessageError" }
         "409": { $ref: "#/components/responses/MessageError" }
+        "413": { $ref: "#/components/responses/PngMemoryLimit" }
         "422": { $ref: "#/components/responses/ValidationError" }
 
   /fields/{fieldId}/stats:
@@ -358,6 +359,7 @@ paths:
           content: { image/png: {} }
         "404": { description: "n ≥ expected_frames, unknown run, or outputs expired", content: { application/json: { schema: { $ref: "#/components/schemas/MessageError" } } } }
         "409": { description: Frame not written yet, content: { application/json: { schema: { $ref: "#/components/schemas/MessageError" } } } }
+        "413": { $ref: "#/components/responses/PngMemoryLimit" }
         "422": { $ref: "#/components/responses/ValidationError" }
 
   /runs/{runId}/frames/{n}/values:
@@ -580,6 +582,11 @@ components:
           schema: { $ref: "#/components/schemas/ValidationError" }
     MessageError:
       description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/MessageError" }
+    PngMemoryLimit:
+      description: The native plane exceeds the available RAM allowance, or the requested downscale cannot fit the configured rendering budget.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/MessageError" }

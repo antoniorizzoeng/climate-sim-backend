@@ -178,14 +178,14 @@ def selected_indices(field, name, index, *, volume=False):
     return var, indices
 
 
-def descending(variable, dim):
+def descending(variable, dim, cells=CHUNK_BYTES // 8, configure=lambda _: None):
     coord = coordinate(variable.group(), dim)
     if coord is None or len(dim) < 2 or np.dtype(coord.dtype).kind not in "iuf":
         return False
+    configure(coord)
     first, last = unpack(coord, [0, len(dim) - 1])
     if not first > last:
         return False
-    cells = CHUNK_BYTES // 8
     for start in range(0, len(dim) - 1, cells):
         positions = unpack(coord, slice(start, start + cells + 1))
         if not np.all(positions[1:] <= positions[:-1]):
@@ -244,12 +244,22 @@ def read_plane(path, field, name=None, index=None, window=None, disk=None):
     with dataset(path) as ds:
         check_decoded_size(ds, disk)
         variable = ds[var["name"]]
-        leading = tuple(indices.values())
-        reversed_axes = tuple(descending(variable, d) for d in variable.get_dims()[-2:])
-        values = read_spatial(
-            variable, leading, spatial, reversed_axes, field_reader(field)
-        )
+        values = field_regions(variable, field, indices)(spatial)
     return values, indices
+
+
+def field_regions(variable, field, indices, **coordinate_options):
+    leading = tuple(indices.values())
+    reversed_axes = tuple(
+        descending(variable, dim, **coordinate_options)
+        for dim in variable.get_dims()[-2:]
+    )
+    read = field_reader(field)
+
+    def region(spatial):
+        return read_spatial(variable, leading, spatial, reversed_axes, read)
+
+    return region
 
 
 def rectangles(ny, nx, cells=CHUNK_BYTES // 8):
@@ -448,46 +458,53 @@ def read_image_plane(path, n, view, auto_range, cancelled=None):
         # A uniform projection or slice can hide variation along the viewing axis.
         value = plane.flat[0]
         uniform = auto_range and np.isfinite(value) and np.all(plane == value)
-        if uniform:
-            for k in range(var.shape[1]):
-                if cancelled is not None and cancelled.is_set():
-                    raise InterruptedError("Export cancelled")
-                for rect in rectangles(*var.shape[-2:]):
-                    if not np.all(var[(n, k) + rect] == value):
-                        return plane, False
-        return plane, uniform
+        return plane, uniform and volume_matches(var, n, value, cancelled=cancelled)
+
+
+def volume_matches(var, n, value, cells=CHUNK_BYTES // 8, cancelled=None):
+    for k in range(var.shape[1]):
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError("Export cancelled")
+        for rect in rectangles(*var.shape[-2:], cells=cells):
+            if not np.all(var[(n, k) + rect] == value):
+                return False
+    return True
+
+
+def frame_regions(var, n, view, cancelled=None):
+    shape = var.shape[1:]
+    if var.ndim == 3:
+        return shape, lambda spatial: np.asarray(var[(n,) + spatial])
+    view = view.resolve(shape)
+    axis = "zyx".index(view.axis)
+
+    def region(spatial):
+        def plane(k):
+            return np.asarray(var[(n,) + spatial[:axis] + (k,) + spatial[axis:]])
+
+        if view.projection == "none":
+            return plane(view.index or 0)
+        reduced = plane(0)
+        if view.projection == "mean":
+            reduced = reduced.astype(np.longdouble)
+        for k in range(1, shape[axis]):
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError("Export cancelled")
+            if view.projection == "max":
+                np.maximum(reduced, plane(k), out=reduced)
+            else:
+                reduced += plane(k)
+        if view.projection == "mean":
+            reduced /= shape[axis]
+            return reduced.astype(np.float64)
+        return reduced
+
+    return view.plane_shape(shape), region
 
 
 def frame_plane(var, n, window, view, cancelled):
-    ny, nx = var.shape[-2:]
-    if var.ndim == 3:
-        if window is None or window == (0, 0, None, None, 1):
-            return np.asarray(var[n])
-        return np.asarray(var[(n,) + window_slices(nx, ny, window)])
-    shape = var.shape[1:]
-    view = view.resolve(shape)
-    ny, nx = view.plane_shape(shape)
-    axis = "zyx".index(view.axis)
-    spatial = window_slices(nx, ny, window)
-
-    def plane(k):
-        return np.asarray(var[(n,) + spatial[:axis] + (k,) + spatial[axis:]])
-
-    if view.projection == "none":
-        return plane(view.index or 0)
-    reduced = plane(0)
-    if view.projection == "mean":
-        reduced = reduced.astype(np.longdouble)
-    for k in range(1, shape[axis]):
-        if cancelled is not None and cancelled.is_set():
-            raise InterruptedError("Export cancelled")
-        if view.projection == "max":
-            np.maximum(reduced, plane(k), out=reduced)
-        else:
-            reduced += plane(k)
-    if view.projection == "mean":
-        return (reduced / shape[axis]).astype(np.float64)
-    return reduced
+    (ny, nx), region = frame_regions(var, n, view, cancelled)
+    return region(window_slices(nx, ny, window))
 
 
 def read_volume(path, n, max_side):
