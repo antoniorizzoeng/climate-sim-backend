@@ -161,8 +161,10 @@ class Download(StreamingResponse):
 M = Depends(manager)
 
 
-@router.get("/health")
+@router.get("/health", responses={503: {}})
 async def health(m=M):
+    if m.worker.done() or m.worker_write_failed:
+        raise HTTPException(503, "Run worker unavailable")
     return JSONResponse(
         dict(status="ok", engine=m.description),
         headers={
@@ -206,7 +208,7 @@ async def drawn(request: Request, m=M):
     return await receive_field(request, m, drawn=True)
 
 
-@router.get("/fields")
+@router.get("/fields", responses={422: {}})
 async def list_fields(params=Depends(page_params), m=M):
     return paginate(m.fields, params)
 
@@ -307,7 +309,7 @@ async def run_view(m, run):
     return m.view(run)
 
 
-@router.get("/runs")
+@router.get("/runs", responses={422: {}})
 async def list_runs(params=Depends(page_params), m=M):
     async with m.lock:
         page = paginate(m.runs, params)
@@ -361,8 +363,12 @@ async def frame_png(
     runId: str, n: RunIndex, options=Depends(style), view=Depends(frame_view), m=M
 ):
     async with m.read_slots:
-        plane, limits = await frame(m, runId, n, netcdf.read_frame, None, view)
-        content = await asyncio.to_thread(png, plane, options, limits, indexed=True)
+        (plane, whole_field), limits = await frame(
+            m, runId, n, netcdf.read_image_plane, view, options.vmin is None
+        )
+        content = await asyncio.to_thread(
+            png, plane, options, limits, indexed=True, whole_field=whole_field
+        )
         return Response(
             content,
             media_type="image/png",

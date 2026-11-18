@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: climate-sim API
-  version: 1.3.0
+  version: 1.3.1
   description: |
     Backend for the climate-sim frontend. Runs the MPI engine (climate-sim-mpi-cpp) locally with mpirun.
     Single local user, no authentication. One run executes at a time (all cores); others wait in a FIFO queue.
@@ -41,8 +41,9 @@ info:
     Accepted: classic, 64-bit offset, CDF-5 and NetCDF-4 (HDF5) files. Only numeric variables with ≥ 2 dimensions
     are listed. The last two dimensions are (y, x); every other dimension is an "extra" dimension that needs an index
     (default 0). If a 1-D coordinate variable for y or x is descending, that axis is reversed so j/i increase with the
-    coordinate. _FillValue / missing_value are masked (compared in stored units), then scale_factor / add_offset are
-    applied once; values are kept as float64 for simulation. Non-finite or masked cells are "missing".
+    coordinate. The effective fill value (including the NetCDF default when filling is enabled) and missing_value
+    are masked in stored units. Then scale_factor and add_offset are applied once. Simulation uses float64.
+    Non-finite or masked cells are "missing".
     The selected plane is written as a 2-D CDF-5 double variable "u" in the run directory and passed as ic.var=u.
 
     With FieldSource.volume enabled, a vertical dimension immediately before (y, x) supplies all z layers.
@@ -54,7 +55,7 @@ info:
     ## Retention (product decision)
     - A field is ACTIVE for 7 days after its last use (creation or a run started from it), then ARCHIVED for 30 days:
       still listed, original file downloadable, usable for new runs or reruns (which make it active again), but no
-      preview/values. Then it is deleted.
+      preview/values. Then it is deleted. Fields used by queued or running jobs stay active with their wind files.
     - A run's outputs (frames, result.nc, exports) are deleted 7 days after it finishes; the run becomes EXPIRED and
       keeps only its request so it can be rerun while its field exists (preset runs can always be rerun until the record
       itself is deleted 37 days after finishing).
@@ -72,6 +73,7 @@ paths:
   /health:
     get:
       operationId: health
+      summary: Returns 503 when the run worker has stopped or is retrying a metadata write.
       responses:
         "200":
           description: OK
@@ -84,6 +86,7 @@ paths:
                 properties:
                   status: { type: string, enum: [ok] }
                   engine: { type: string, description: Engine binary path and version }
+        "503": { $ref: "#/components/responses/MessageError" }
 
   /config:
     get:
@@ -132,6 +135,7 @@ paths:
                 properties:
                   items: { type: array, items: { $ref: "#/components/schemas/Field" } }
                   next_cursor: { type: [string, "null"] }
+        "422": { $ref: "#/components/responses/ValidationError" }
 
   /fields/drawn:
     post:
@@ -282,6 +286,7 @@ paths:
                 properties:
                   items: { type: array, items: { $ref: "#/components/schemas/Run" } }
                   next_cursor: { type: [string, "null"] }
+        "422": { $ref: "#/components/responses/ValidationError" }
 
   /runs/validate:
     post:
@@ -831,7 +836,8 @@ components:
           description: >
             Fixed default colour range for the whole run, from frame 0 (widened to include 0 when any edge is dirichlet).
             Advection–diffusion with these schemes cannot leave this range, so colours never shift during playback.
-            A constant field renders as the colormap midpoint.
+            A constant field renders as the colormap midpoint. Slices and projections of a nonuniform volume
+            use the run range even when every pixel in the view has the same value.
         message: { type: [string, "null"], description: Error text when status is error }
 
     NowcastParams:

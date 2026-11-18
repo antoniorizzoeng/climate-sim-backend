@@ -5,7 +5,7 @@
 [![CI status](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/ci.yml)
 [![CodeQL status](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/codeql.yml/badge.svg)](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/codeql.yml)
 [![License AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-52475e)](LICENSE)
-[![API version 1.3.0](https://img.shields.io/badge/API-1.3.0-9c523c)](api/openapi.yaml)
+[![API version 1.3.1](https://img.shields.io/badge/API-1.3.1-9c523c)](api/openapi.yaml)
 
 <p align="center">
   <img src="docs/assets/braid-projection.gif" width="820" alt="Three gold and violet tracer filaments travel across a periodic volume, seen in maximum projection."/>

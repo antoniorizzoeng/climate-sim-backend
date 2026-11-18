@@ -14,7 +14,7 @@ from PIL import Image
 
 from .disk import CHUNK_BYTES
 from .models import Colormap
-from .netcdf import FrameView, read_frame, rectangles
+from .netcdf import FrameView, read_image_plane, rectangles
 
 
 @dataclass(frozen=True)
@@ -33,14 +33,16 @@ def palette(name):
     return np.vstack((rgba, bad)), rgba.tobytes()
 
 
-def color_indices(values, style, limits, colors):
+def color_indices(values, style, limits, colors, whole_field):
     lo, hi = (
         (limits or (None, None)) if style.vmin is None else (style.vmin, style.vmax)
     )
     finite = np.isfinite(values)
     opaque = finite.all()
-    # Uniform planes use the midpoint by default even with a widened run range.
-    uniform = style.vmin is None and opaque and values.min() == values.max()
+    # Constant fields use the midpoint by default even with a widened run range.
+    uniform = (
+        whole_field and style.vmin is None and opaque and values.min() == values.max()
+    )
     dtype = np.uint8 if opaque else np.uint16
     if lo is None or lo == hi or uniform:
         indices = np.full(values.shape, colors // 2, dtype)
@@ -72,9 +74,9 @@ def display_size(nx, ny, max_side):
     return max(1, round(nx * scale)), max(1, round(ny * scale))
 
 
-def render(values, style, limits, *, indexed=False):
+def render(values, style, limits, *, indexed=False, whole_field=True):
     lut, rgba_bytes = palette(style.colormap)
-    indices, opaque = color_indices(values, style, limits, len(lut) - 1)
+    indices, opaque = color_indices(values, style, limits, len(lut) - 1, whole_field)
     ny, nx = indices.shape
     size = display_size(nx, ny, style.max_side)
     if size != (nx, ny):
@@ -95,9 +97,11 @@ def render(values, style, limits, *, indexed=False):
     return Image.fromarray(lut[indices])
 
 
-def png(values, style, limits, *, indexed=False):
+def png(values, style, limits, *, indexed=False, whole_field=True):
     buf = io.BytesIO()
-    render(values, style, limits, indexed=indexed).save(buf, format="PNG")
+    render(values, style, limits, indexed=indexed, whole_field=whole_field).save(
+        buf, format="PNG"
+    )
     return buf.getvalue()
 
 
@@ -105,6 +109,8 @@ def export_name(fmt, fps, style, view=FrameView()):
     options = [fps, asdict(style)]
     if view != FrameView():
         options.append(asdict(view))
+        if style.vmin is None:
+            options.append("whole-volume-scale")
     key = json.dumps(options, sort_keys=True).encode()
     return f"export-{hashlib.sha256(key).hexdigest()}.{fmt}"
 
@@ -256,8 +262,12 @@ def encode(
         return
 
     def frame(n):
-        plane = read_frame(directory / "result.nc", n, view=view, cancelled=cancelled)
-        return render(plane, style, run["display_range"]).convert("RGB")
+        plane, whole_field = read_image_plane(
+            directory / "result.nc", n, view, style.vmin is None, cancelled
+        )
+        return render(
+            plane, style, run["display_range"], whole_field=whole_field
+        ).convert("RGB")
 
     grid = run["resolved"]
     ny, nx = view.plane_shape((grid["nz"], grid["ny"], grid["nx"]))

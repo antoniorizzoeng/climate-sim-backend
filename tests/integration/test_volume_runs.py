@@ -171,3 +171,28 @@ def test_extrude_drawing_and_single_layer(live):
     completed = poll(live, url + "/export.gif", lambda r: r.status_code != 202)
     assert completed.status_code == 200
     assert live.get(url + "/export.gif" + query).content == completed.content
+
+
+@pytest.mark.parametrize("bottom,top", [(0, 1), (1, 1)])
+def test_uniform_volume_views_share_field_scale(live, tmp_path, bottom, top):
+    path = tmp_path / "layers.nc"
+    with netcdf.dataset(path, "w") as ds:
+        for name, size in [("z", 2), ("y", 4), ("x", 4)]:
+            ds.createDimension(name, size)
+        u = ds.createVariable("u", "f8", ("z", "y", "x"))
+        u[0], u[1] = bottom, top
+    field = live.post("/fields", files={"file": (path.name, path.read_bytes())}).json()
+    source = dict(kind="field", field_id=field["id"], volume=True)
+    run, url = complete(live, dict(source=source, dt=1, steps=1, processes=1))
+    assert run["display_range"] == [0, 1]
+    for view, expected in [("slice=0", 0), ("slice=1", 255), ("projection=max", 255)]:
+        if bottom == top:
+            expected = 128
+        query = "?colormap=gray&axis=z&" + view
+        for endpoint in ("/frames/0.png", "/export.gif"):
+            response = poll(
+                live, url + endpoint + query, lambda r: r.status_code != 202
+            )
+            assert response.status_code == 200
+            image = Image.open(io.BytesIO(response.content)).convert("RGBA")
+            assert image.getpixel((0, 0)) == (expected,) * 3 + (255,)

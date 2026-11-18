@@ -4,6 +4,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from math import prod
 from mmap import ACCESS_READ, mmap
+from operator import getitem
 from threading import Lock
 
 import netCDF4
@@ -25,11 +26,15 @@ def dataset(path, *args, **kwargs):
 def unpack(variable, selection):
     raw = np.asarray(variable[selection])
     attrs = variable.ncattrs()
-    missing = [
-        variable.getncattr(attr)
-        for attr in ("_FillValue", "missing_value")
-        if attr in attrs
-    ]
+    missing = []
+    if "_FillValue" in attrs:
+        missing.append(variable._FillValue)
+    elif variable.get_fill_value() is not None:
+        # libnetcdf returns the implicit value in native byte order, even for
+        # a non-native variable. Use the declared type's NetCDF constant.
+        missing.append(netCDF4.default_fillvals[raw.dtype.str[1:]])
+    if "missing_value" in attrs:
+        missing.append(variable.missing_value)
     if getattr(variable, "_Unsigned", "") == "true" and raw.dtype.kind == "i":
         packed = raw.view(
             np.dtype(f"u{raw.itemsize}").newbyteorder(raw.dtype.byteorder)
@@ -194,12 +199,18 @@ def reverse_slice(selection, length):
     return slice(length - 1 - last, length - selection.start, selection.step)
 
 
-def read_spatial(variable, leading, spatial, reversed_axes):
+def field_reader(field):
+    # Drawings contain only validated, unpacked finite doubles. Older CDF-5
+    # drawings have no explicit fill attribute to distinguish valid fill numbers.
+    return getitem if field.get("source") == "drawn" else unpack
+
+
+def read_spatial(variable, leading, spatial, reversed_axes, read):
     selection = tuple(
         reverse_slice(part, length) if reverse else part
         for part, length, reverse in zip(spatial, variable.shape[-2:], reversed_axes)
     )
-    values = unpack(variable, leading + selection)
+    values = read(variable, leading + selection)
     return np.flip(
         values, axis=tuple(i for i, reverse in enumerate(reversed_axes) if reverse)
     )
@@ -235,7 +246,9 @@ def read_plane(path, field, name=None, index=None, window=None, disk=None):
         variable = ds[var["name"]]
         leading = tuple(indices.values())
         reversed_axes = tuple(descending(variable, d) for d in variable.get_dims()[-2:])
-        values = read_spatial(variable, leading, spatial, reversed_axes)
+        values = read_spatial(
+            variable, leading, spatial, reversed_axes, field_reader(field)
+        )
     return values, indices
 
 
@@ -277,11 +290,11 @@ def stats(values, name, indices):
     )
 
 
-def variable_stats(ds, var, indices):
+def variable_stats(ds, var, indices, read):
     variable = ds[var["name"]]
     ny, nx = var["ny"], var["nx"]
     leading = tuple(indices.values())
-    blocks = (unpack(variable, leading + rect) for rect in rectangles(ny, nx))
+    blocks = (read(variable, leading + rect) for rect in rectangles(ny, nx))
     return summarize(blocks, ny, nx, var["name"], indices)
 
 
@@ -289,7 +302,7 @@ def field_stats(path, field, name, index, disk):
     var, indices = selected_indices(field, name, index)
     with dataset(path) as ds:
         check_decoded_size(ds, disk)
-        return variable_stats(ds, var, indices)
+        return variable_stats(ds, var, indices, field_reader(field))
 
 
 def inspect_field(path, disk=None):
@@ -311,7 +324,7 @@ def inspect_field(path, disk=None):
             return dict(
                 variables=available,
                 default_var=default["name"],
-                default_stats=variable_stats(ds, default, indices),
+                default_stats=variable_stats(ds, default, indices, unpack),
             )
     except DiskSpaceError:
         raise
@@ -348,13 +361,14 @@ def prepare_input(path, field, source, disk, target=None):
         dims = variable.get_dims()
         flip = tuple(descending(variable, d) for d in dims[-2:])
         reverse_z = volume and descending(variable, dims[-3])
+        read = field_reader(field)
         for k in range(layers):
             if volume:
                 input_z = layers - 1 - k if reverse_z else k
                 leading = (*leading[:-1], input_z)
             output_layer = (k,) if volume else ()
             for rect in rectangles(ny, nx):
-                block = read_spatial(variable, leading, rect, flip)
+                block = read_spatial(variable, leading, rect, flip, read)
                 missing = ~np.isfinite(block)
                 if missing.any():
                     if source.fill_value is None:
@@ -371,7 +385,11 @@ def write_plane(path, values, *, drawn=False):
     with dataset(path, "w", format="NETCDF3_64BIT_DATA") as ds:
         ds.createDimension("y", ny)
         ds.createDimension("x", nx)
-        variable = ds.createVariable("u", "f8", ("y", "x"), fill_value=False)
+        # CDF-5 does not persist no-fill mode. An explicit NaN sentinel keeps
+        # every finite drawing value valid when another NetCDF reader opens it.
+        variable = ds.createVariable(
+            "u", "f8", ("y", "x"), fill_value=np.nan if drawn else False
+        )
         for rect in rectangles(ny, nx):
             block = values[rect]
             if drawn and not np.isfinite(block).all():
@@ -418,35 +436,58 @@ class FrameView:
 def read_frame(path, n, window=None, view=FrameView(), cancelled=None):
     with dataset(path) as ds:
         var = ds["u"]
-        ny, nx = var.shape[-2:]
+        return frame_plane(var, n, window, view, cancelled)
+
+
+def read_image_plane(path, n, view, auto_range, cancelled=None):
+    with dataset(path) as ds:
+        var = ds["u"]
+        plane = frame_plane(var, n, None, view, cancelled)
         if var.ndim == 3:
-            if window is None or window == (0, 0, None, None, 1):
-                return np.asarray(var[n])
-            return np.asarray(var[(n,) + window_slices(nx, ny, window)])
-        shape = var.shape[1:]
-        view = view.resolve(shape)
-        ny, nx = view.plane_shape(shape)
-        axis = "zyx".index(view.axis)
-        spatial = window_slices(nx, ny, window)
+            return plane, True
+        # A uniform projection or slice can hide variation along the viewing axis.
+        value = plane.flat[0]
+        uniform = auto_range and np.isfinite(value) and np.all(plane == value)
+        if uniform:
+            for k in range(var.shape[1]):
+                if cancelled is not None and cancelled.is_set():
+                    raise InterruptedError("Export cancelled")
+                for rect in rectangles(*var.shape[-2:]):
+                    if not np.all(var[(n, k) + rect] == value):
+                        return plane, False
+        return plane, uniform
 
-        def plane(k):
-            return np.asarray(var[(n,) + spatial[:axis] + (k,) + spatial[axis:]])
 
-        if view.projection == "none":
-            return plane(view.index or 0)
-        reduced = plane(0)
-        if view.projection == "mean":
-            reduced = reduced.astype(np.longdouble)
-        for k in range(1, shape[axis]):
-            if cancelled is not None and cancelled.is_set():
-                raise InterruptedError("Export cancelled")
-            if view.projection == "max":
-                np.maximum(reduced, plane(k), out=reduced)
-            else:
-                reduced += plane(k)
-        if view.projection == "mean":
-            return (reduced / shape[axis]).astype(np.float64)
-        return reduced
+def frame_plane(var, n, window, view, cancelled):
+    ny, nx = var.shape[-2:]
+    if var.ndim == 3:
+        if window is None or window == (0, 0, None, None, 1):
+            return np.asarray(var[n])
+        return np.asarray(var[(n,) + window_slices(nx, ny, window)])
+    shape = var.shape[1:]
+    view = view.resolve(shape)
+    ny, nx = view.plane_shape(shape)
+    axis = "zyx".index(view.axis)
+    spatial = window_slices(nx, ny, window)
+
+    def plane(k):
+        return np.asarray(var[(n,) + spatial[:axis] + (k,) + spatial[axis:]])
+
+    if view.projection == "none":
+        return plane(view.index or 0)
+    reduced = plane(0)
+    if view.projection == "mean":
+        reduced = reduced.astype(np.longdouble)
+    for k in range(1, shape[axis]):
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError("Export cancelled")
+        if view.projection == "max":
+            np.maximum(reduced, plane(k), out=reduced)
+        else:
+            reduced += plane(k)
+    if view.projection == "mean":
+        return (reduced / shape[axis]).astype(np.float64)
+    return reduced
 
 
 def read_volume(path, n, max_side):

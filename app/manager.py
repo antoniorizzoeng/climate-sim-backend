@@ -107,6 +107,7 @@ class RunManager:
         self.active = None
         self.exports = {}
         self.closing = False
+        self.worker_write_failed = False
         self.nowcasts = Nowcasts(self, ACTIVE)
 
     async def start(self):
@@ -115,12 +116,23 @@ class RunManager:
         try:
             fcntl.flock(self.owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.fields.load()
+            # Recompute cached statistics and coordinate labels from pre-1.3.1 uploads.
+            marker = self.settings.data / ".implicit-fill-upgraded"
+            upgrade_uploads = not marker.exists()
             for field in self.fields.records.values():
+                if upgrade_uploads and field["source"] == "upload":
+                    meta = await asyncio.to_thread(
+                        netcdf.inspect_field, self.field_path(field)
+                    )
+                    self.fields.update(field, **meta)
+                    continue
                 if any("nz" not in var for var in field["variables"]):
                     await asyncio.to_thread(
                         netcdf.upgrade_field, self.field_path(field), field
                     )
                     self.fields.update(field, variables=field["variables"])
+            if upgrade_uploads:
+                marker.touch()
             self.runs.load()
             for run in sorted(self.runs.records.values(), key=lambda r: r["_order"]):
                 run["resolved"].setdefault("nz", 1)
@@ -162,8 +174,10 @@ class RunManager:
         self.janitor.cancel()
         with suppress(asyncio.CancelledError):
             await self.janitor
-        await self.worker
-        self.owner.close()
+        try:
+            await self.worker
+        finally:
+            self.owner.close()
 
     async def housekeeping(self):
         while True:
@@ -174,8 +188,10 @@ class RunManager:
     async def cleanup(self):
         now = self.clock()
         self.nowcasts.cleanup(now)
+        pinned_fields = set()
         for run in list(self.runs.records.values()):
             if run["status"] in ("queued", "running"):
+                pinned_fields.add(run["request"]["source"].get("field_id"))
                 continue
             finished = datetime.fromisoformat(run["finished_at"])
             if now >= finished + ACTIVE:
@@ -195,6 +211,8 @@ class RunManager:
                         if path.name != "metadata.json":
                             path.unlink()
         for item in list(self.fields.records.values()):
+            if item["id"] in pinned_fields:
+                continue
             used = datetime.fromisoformat(item["last_used_at"])
             if now >= used + LIFETIME:
                 self.fields.remove(item["id"])
@@ -483,92 +501,99 @@ class RunManager:
         self.nowcasts.notify()
 
     async def work(self):
-        while True:
+        completed = None
+        while not self.closing:
             await self.wake.wait()
-            with ExitStack() as writes:
-                async with self.lock:
-                    if self.closing:
-                        return
-                    if not self.queue:
-                        self.wake.clear()
-                        continue
-                    identifier = self.queue.popleft()
-                    run = self.runs.records[identifier]
-                    directory = self.runs.root / identifier
-                    self.update_run(
-                        run, status="running", started_at=self.clock().isoformat()
-                    )
-                    self.nowcasts.notify()
-                    if (
-                        run.get("_wind_limit") is not None
-                        and not self.nowcasts.supported
-                    ):
-                        self.finish(run, self.nowcasts.probe_message)
-                        continue
-                    field_id = run["request"]["source"].get("field_id")
-                    if field_id in self.fields.records:
-                        self.touch(self.fields.records[field_id])
-                    args = [
-                        self.settings.mpirun,
-                        *self.settings.mpi_args,
-                        "-np",
-                        str(run["resolved"]["processes"]),
-                        self.settings.engine,
-                        f"--config={directory}/config.yaml",
-                        f"--output={directory}/result.nc",
-                        f"--progress={directory}/progress.json",
-                    ]
-                    try:
-                        writes.enter_context(
-                            self.disk.reserve(
-                                run["resolved"]["estimated_output_bytes"],
-                                "simulation output",
-                                directory / "result.nc",
-                            )
-                        )
-                        with (directory / "engine.log").open("wb") as log:
-                            proc = await asyncio.create_subprocess_exec(
-                                *args,
-                                cwd=directory,
-                                start_new_session=True,
-                                stdout=log,
-                                stderr=log,
-                            )
-                    except (OSError, DiskSpaceError) as exc:
-                        self.finish(run, str(exc))
-                        continue
-                    self.active, self.process = identifier, proc
-                code = await proc.wait()
-                async with self.lock:
-                    if identifier in self.runs.records and not self.closing:
-                        try:
-                            info = await self.refresh(run, strict=True)
-                            message = None
-                            if (
-                                code
-                                or info.get("status") != "done"
-                                or run["frames"] != run["resolved"]["expected_frames"]
-                            ):
-                                message = (
-                                    info.get("message")
-                                    or f"Engine exited with code {code} without completing output"
-                                )
-                            if message and not info.get("message"):
-                                with (directory / "engine.log").open("rb") as log:
-                                    log.seek(max(0, log.seek(0, os.SEEK_END) - 2048))
-                                    tail = log.read().decode(errors="replace").strip()
-                                if tail:
-                                    message += f"\n{tail}"
+            try:
+                if completed is None:
+                    completed = await self.run_next()
+                else:
+                    async with self.lock:
+                        run, message = completed
+                        if not self.closing and run["id"] in self.runs.records:
                             self.finish(run, message)
-                        except (
-                            OSError,
-                            RuntimeError,
-                            ValueError,
-                            IndexError,
-                            KeyError,
-                        ) as exc:
-                            self.finish(run, f"Cannot read engine output: {exc}")
-                    self.process = self.active = None
+                        self.worker_write_failed = False
+                        completed = None
+            except OSError as exc:
+                if not self.worker_write_failed:
+                    log_event("worker_write_failed", message=str(exc))
+                self.worker_write_failed = True
+                await asyncio.sleep(0.25)
+
+    async def run_next(self):
+        with ExitStack() as writes:
+            async with self.lock:
+                if self.closing or not self.queue:
+                    self.wake.clear()
+                    self.worker_write_failed = False
+                    return None
+                identifier = self.queue[0]
+                run = self.runs.records[identifier]
+                directory = self.runs.root / identifier
+                field_id = run["request"]["source"].get("field_id")
+                if field_id in self.fields.records:
+                    self.touch(self.fields.records[field_id])
+                self.update_run(
+                    run, status="running", started_at=self.clock().isoformat()
+                )
+                self.queue.popleft()
+                self.worker_write_failed = False
+                self.nowcasts.notify()
+                if run.get("_wind_limit") is not None and not self.nowcasts.supported:
+                    return run, self.nowcasts.probe_message
+                args = [
+                    self.settings.mpirun,
+                    *self.settings.mpi_args,
+                    "-np",
+                    str(run["resolved"]["processes"]),
+                    self.settings.engine,
+                    f"--config={directory}/config.yaml",
+                    f"--output={directory}/result.nc",
+                    f"--progress={directory}/progress.json",
+                ]
+                try:
+                    writes.enter_context(
+                        self.disk.reserve(
+                            run["resolved"]["estimated_output_bytes"],
+                            "simulation output",
+                            directory / "result.nc",
+                        )
+                    )
+                    with (directory / "engine.log").open("wb") as log:
+                        proc = await asyncio.create_subprocess_exec(
+                            *args,
+                            cwd=directory,
+                            start_new_session=True,
+                            stdout=log,
+                            stderr=log,
+                        )
+                except (OSError, DiskSpaceError) as exc:
+                    return run, str(exc)
+                self.active, self.process = identifier, proc
+            code = await proc.wait()
+            async with self.lock:
+                self.process = self.active = None
+                if identifier in self.runs.records and not self.closing:
+                    return run, await self.engine_message(run, directory, code)
+
+    async def engine_message(self, run, directory, code):
+        try:
+            info = await self.refresh(run, strict=True)
+            if (
+                not code
+                and info.get("status") == "done"
+                and run["frames"] == run["resolved"]["expected_frames"]
+            ):
+                return None
+            if info.get("message"):
+                return info["message"]
+            message = f"Engine exited with code {code} without completing output"
+            with (directory / "engine.log").open("rb") as log:
+                log.seek(max(0, log.seek(0, os.SEEK_END) - 2048))
+                tail = log.read().decode(errors="replace").strip()
+            return f"{message}\n{tail}" if tail else message
+        except (OSError, RuntimeError, ValueError, IndexError, KeyError) as exc:
+            return f"Cannot read engine output: {exc}"
 
     async def stop_process(self):
         proc = self.process

@@ -186,3 +186,41 @@ def test_child_group_coordinates_for_inherited_dimensions(tmp_path):
     field = netcdf.inspect_field(path)
     plane, _ = netcdf.read_plane(path, field)
     assert plane.tolist() == [[3, 4, 5], [0, 1, 2]]
+
+
+def test_implicit_fill_in_non_native_packed_data(tmp_path):
+    import sys
+
+    endian = "big" if sys.byteorder == "little" else "little"
+    dtype = ">i2" if endian == "big" else "<i2"
+    path = tmp_path / "packed.nc"
+    with netcdf.dataset(path, "w") as ds:
+        ds.createDimension("y", 2)
+        ds.createDimension("x", 2)
+        var = ds.createVariable("packed", dtype, ("y", "x"), endian=endian)
+        var[0] = [-2, 384]
+        var._Unsigned = "true"
+        var.scale_factor = 0.5
+    field = netcdf.inspect_field(path)
+    plane, _ = netcdf.read_plane(path, field)
+    np.testing.assert_equal(plane, [[32767, 192], [np.nan, np.nan]])
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_drawn_default_fill_number_remains_a_finite_input(client, legacy):
+    value = netCDF4.default_fillvals["f8"]
+    field = draw(client, np.full((4, 4), value, dtype="<f4")).json()
+    assert field["default_stats"]["missing_count"] == 0
+    if legacy:
+        path = client.app.state.manager.field_path(field)
+        with netcdf.dataset(path, "w", format="NETCDF3_64BIT_DATA") as ds:
+            for name in ("y", "x"):
+                ds.createDimension(name, 4)
+            ds.createVariable("u", "f8", ("y", "x"), fill_value=False)[:] = value
+    url = "/fields/" + field["id"]
+    assert client.get(url + "/stats").json()["min"] == value
+    np.testing.assert_equal(
+        np.frombuffer(client.get(url + "/values").content, "<f4"), value
+    )
+    body = dict(source=dict(kind="field", field_id=field["id"]), steps=1, dt=1)
+    assert client.post("/runs/validate", json=body).json()["ok"]
