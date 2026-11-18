@@ -13,6 +13,7 @@ Colormap = Literal[
 ]
 Index = Annotated[int, Field(ge=0)]
 ENGINE_INT_MAX = 2**31 - 1
+DEFAULT_BLEND_TAU_HOURS = 2.0
 
 
 class RequestModel(BaseModel):
@@ -192,6 +193,7 @@ class NowcastParams(RequestModel):
     radius_km: float = Field(300, ge=50, le=1000)
     hours: int = Field(6, ge=1, le=12)
     resolution: int = Field(96, ge=16, le=256)
+    blend_tau_hours: float = Field(DEFAULT_BLEND_TAU_HOURS, gt=0)
 
     @model_validator(mode="after")
     def check_projection(self):

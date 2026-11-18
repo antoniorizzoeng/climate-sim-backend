@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 from datetime import datetime
 
 import numpy as np
@@ -55,6 +56,10 @@ def test_unavailable_and_validation(client):
         dict(PARAMS, hours=13),
         dict(PARAMS, radius_km=49),
         dict(PARAMS, lon=181),
+        dict(PARAMS, blend_tau_hours=0),
+        dict(PARAMS, blend_tau_hours=-2),
+        dict(PARAMS, blend_tau_hours="2"),
+        dict(PARAMS, blend_tau_hours=None),
         dict(PARAMS, other=0),
     ):
         assert client.post("/nowcasts", json=body).status_code == 422
@@ -62,7 +67,10 @@ def test_unavailable_and_validation(client):
     assert r.status_code == 202
     item = r.json()
     assert item["status"] == "error" and "wind.mode=file" in item["message"]
-    assert item["params"] == dict(lat=0, lon=0, radius_km=300, hours=6, resolution=96)
+    assert item["params"] == dict(
+        lat=0, lon=0, radius_km=300, hours=6, resolution=96, blend_tau_hours=2
+    )
+    assert item["best_window"] is None
     assert item["site"] is None and item["layers"] == []
     assert client.get("/nowcasts/missing").status_code == 404
     assert client.post("/nowcasts/missing/refresh").status_code == 404
@@ -72,7 +80,7 @@ def test_unavailable_and_validation(client):
 def test_queue_frames_comparison_refresh_delete_restart(supported, settings, clock):
     with TestClient(create_app(settings, clock)) as c:
         m = c.app.state.manager
-        r = c.post("/nowcasts", json=PARAMS)
+        r = c.post("/nowcasts", json=dict(PARAMS, blend_tau_hours=1.5))
         assert r.status_code == 202 and r.json()["status"] == "fetching"
         url = "/nowcasts/" + r.json()["id"]
         item = await_state(c, url, "queued")
@@ -135,6 +143,18 @@ def test_queue_frames_comparison_refresh_delete_restart(supported, settings, clo
         rows = done["site"]
         assert len(rows) == 13
         assert rows[0]["nowcast"] == pytest.approx(sky.cover(0.2, 0.3, 0.4))
+        assert rows[0]["blend"] == rows[0]["nowcast"]
+        assert done["params"]["blend_tau_hours"] == 1.5
+        weight = math.exp(-1 / 1.5)
+        assert rows[6]["blend"] == pytest.approx(
+            sky.cover(
+                low=weight * 0.2,
+                mid=weight * 0.3,
+                high=weight * 0.4,
+                total=weight * (1 - 0.8 * 0.7 * 0.6) + (1 - weight) * 0.5,
+            )
+        )
+        assert done["best_window"] is None
         assert rows[3]["model"]["total"] == pytest.approx(0.35)
         assert rows[3]["model"]["low"] == 0
         assert rows[5]["jet_ms"] == 20 and rows[6]["jet_ms"] == 30
@@ -168,6 +188,37 @@ def test_queue_frames_comparison_refresh_delete_restart(supported, settings, clo
             c.get("/fields/" + duplicate["request"]["source"]["field_id"]).status_code
             == 200
         )
+
+
+def test_saved_nowcast_gains_blend_on_restart(settings, clock):
+    with TestClient(create_app(settings, clock)) as c:
+        record = c.post("/nowcasts", json=PARAMS).json()
+    path = settings.data / "nowcasts" / record["id"] / "metadata.json"
+    del record["params"]["blend_tau_hours"], record["best_window"]
+    time = clock().isoformat()
+    record.update(
+        status="done",
+        data_time=time,
+        message=None,
+        site=[
+            dict(
+                time=time,
+                nowcast=sky.cover(0.1, 0, 0),
+                model=sky.cover(0.8, 0, 0),
+                jet_ms=15,
+                seeing="good",
+            )
+        ],
+    )
+    path.write_text(json.dumps(record))
+    with TestClient(create_app(settings, clock)) as c:
+        upgraded = c.get(f"/nowcasts/{record['id']}").json()
+    assert json.loads(path.read_text()) == upgraded
+    assert upgraded["params"]["blend_tau_hours"] == 2
+    assert upgraded["site"][0]["blend"] == record["site"][0]["nowcast"]
+    assert upgraded["best_window"] == dict(
+        start=time, end=time, mean_clear=0.9, seeing="good"
+    )
 
 
 def test_fetch_failure_expiry_and_deletion(supported, settings, clock, monkeypatch):

@@ -1,4 +1,5 @@
 import math
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -75,3 +76,29 @@ def test_bilinear_centre(tmp_path, n):
             ds.createDimension(dim, size)
         ds.createVariable("u", "f8", ("time", "y", "x"))[:] = [plane, plane * 0]
     np.testing.assert_allclose(sky.site_samples(path), [1 if n % 2 else 0.25, 0])
+
+
+def test_best_window_requires_contiguous_clear_samples_and_prefers_earliest_tie():
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = [
+        dict(
+            time=(start + timedelta(minutes=10 * i)).isoformat(),
+            blend=dict(clear=clear),
+            seeing=seeing,
+        )
+        for i, (clear, seeing) in enumerate(
+            [
+                (1, "good"),
+                (1, "poor"),
+                (0.70, "good"),
+                (0.8, "fair"),
+                (0.69, "good"),
+                (0.9, "good"),
+                (1, "good"),
+            ]
+        )
+    ]
+    assert sky.best_window(rows) == dict(
+        start=rows[2]["time"], end=rows[3]["time"], mean_clear=0.75, seeing="fair"
+    )
+    assert sky.best_window(rows[1:2] + rows[4:5]) is None

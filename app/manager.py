@@ -6,7 +6,7 @@ import signal
 import threading
 from collections import deque
 from contextlib import ExitStack, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -18,7 +18,7 @@ from . import models, netcdf
 from .disk import DiskBudget, DiskSpaceError
 from .events import log_event
 from .models import ENGINE_INT_MAX, FieldSource, invalid, issue, resolve
-from .nowcasts import Nowcasts
+from .nowcasts import Nowcasts, probe_periodic
 from .render import display_range, encode, export_name
 from .sky import wind_config
 from .storage import Collection
@@ -132,6 +132,9 @@ class RunManager:
                     self.finish(run, "interrupted by restart")
                 elif run["status"] == "queued":
                     self.queue.append(run["id"])
+            if self.settings.periodic:
+                periodic = await asyncio.to_thread(probe_periodic, self.settings)
+                self.settings = replace(self.settings, periodic=periodic)
             await self.nowcasts.start()
             await self.cleanup()
             self.description = await asyncio.to_thread(self.settings.engine_description)
