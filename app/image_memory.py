@@ -1,7 +1,8 @@
 from math import prod
-from pathlib import Path
 
 import psutil
+
+from .memory import cgroup_directories
 
 # Allow for NetCDF reads and unpacking, projection accumulators, and PNG
 # conversion buffers. A masked, packed field can need several arrays per cell.
@@ -17,16 +18,7 @@ def available_ram():
     available = psutil.virtual_memory().available
     # A container can have less headroom than the host reports. On cgroup v2,
     # a parent also limits the memory available to its descendants.
-    root = Path("/sys/fs/cgroup")
-    try:
-        groups = Path("/proc/self/cgroup").read_text().splitlines()
-        relative = next(line[3:] for line in groups if line.startswith("0::"))
-    except (OSError, StopIteration):
-        return available
-    group = root / relative.lstrip("/")
-    for directory in (group, *group.parents):
-        if directory != root and root not in directory.parents:
-            break
+    for directory in cgroup_directories():
         try:
             limit = (directory / "memory.max").read_text().strip()
             if limit != "max":

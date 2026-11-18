@@ -30,7 +30,7 @@ def test_contract(client):
     assert (
         spec["info"]["version"]
         == client.get("/health").json()["api_version"]
-        == "1.5.0"
+        == "1.6.0"
     )
     expected = {
         (p, method.upper()): set(map(int, op["responses"]))
@@ -152,20 +152,44 @@ def test_owner_lock_and_staging_recovery(settings):
             pass
 
 
-def test_launcher_failure_includes_diagnostic(settings, tmp_path):
+@pytest.mark.parametrize(
+    "exit_source, diagnostic, reason",
+    [
+        ("sys.exit(137)", "launcher diagnostic", "oom"),
+        ("os.kill(os.getpid(), 9)", "launcher diagnostic", "oom"),
+        ("sys.exit(1)", "rank 1 exited on signal 9 (Killed)", "oom"),
+        ("sys.exit(1)", "rank 1 terminated with SIGKILL", "oom"),
+        (
+            "sys.exit(17)",
+            "launcher diagnostic",
+            "The engine stopped with exit code 17.",
+        ),
+        (
+            "sys.exit(0)",
+            "launcher diagnostic",
+            "Engine exited with code 0 without completing output",
+        ),
+    ],
+)
+def test_launcher_failure_includes_diagnostic(
+    settings, tmp_path, exit_source, diagnostic, reason
+):
     import sys
     from dataclasses import replace
 
     script = tmp_path / "launcher.py"
+    raw = f"----------\n\n{diagnostic}\n\n \n  detail\n------------\n"
     script.write_text(
-        "import sys\nsys.stderr.write('launcher diagnostic')\nsys.exit(17)"
+        f"import os, sys\nsys.stderr.write({raw!r})\nsys.stderr.flush()\n{exit_source}"
     )
     with TestClient(
         create_app(replace(settings, mpirun=sys.executable, mpi_args=(str(script),)))
     ) as c:
         run = c.post("/runs", json=preset()).json()
         error = wait_run(c, run["id"], "error")
-        assert "17" in error["message"] and "launcher diagnostic" in error["message"]
+        if reason == "oom":
+            reason = "The engine ran out of memory and was stopped by the system."
+        assert error["message"].splitlines() == [reason, diagnostic, "  detail"]
 
 
 def test_rerun_expired_preset(settings, clock):

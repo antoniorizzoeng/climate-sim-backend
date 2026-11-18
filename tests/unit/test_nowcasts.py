@@ -115,6 +115,10 @@ def test_queue_frames_comparison_refresh_delete_restart(supported, settings, clo
                 assert ds["vx"][0, 20, 20] > 0
             assert run["resolved"]["expected_frames"] == 13
             assert run["resolved"]["dt_max"] > run["request"]["dt"]
+            ranks = run["resolved"]["processes"]
+            assert run["resolved"]["estimated_memory_bytes"] == (
+                44 * 41**2 + (64 + 16 * ranks) * 1024**2
+            )
         # Restart with all three runs queued. The retained records supply the model comparison.
     with TestClient(create_app(settings, clock)) as c:
         m = c.app.state.manager
@@ -184,6 +188,10 @@ def test_queue_frames_comparison_refresh_delete_restart(supported, settings, clo
         ).total_seconds() == 7200
         # A standalone rerun has its own lifetime and the same file-driven config.
         duplicate = c.post("/runs/" + runs[0]["id"] + "/rerun").json()
+        assert (
+            duplicate["resolved"]["estimated_memory_bytes"]
+            == runs[0]["resolved"]["estimated_memory_bytes"]
+        )
         assert (
             yaml.safe_load((m.runs.root / duplicate["id"] / "config.yaml").read_text())[
                 "wind"

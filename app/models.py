@@ -7,6 +7,8 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.types import StringConstraints
 
+from .memory import estimate_engine_memory
+
 Boundary = Literal["dirichlet", "neumann", "periodic"]
 Preset = Literal["gaussian_hotspot", "constant_zero"]
 Colormap = Literal[
@@ -186,7 +188,9 @@ def header_extent(source_units):
     return 4096 * (1 + (len(source_units.encode()) + 4095) // 4096)
 
 
-def resolve(req, nx, ny, settings, available_bytes, nz=1, source_units="1"):
+def resolve(
+    req, nx, ny, settings, available_bytes, nz=1, source_units="1", *, wind_components=0
+):
     errors = []
     if req.frames is not None and req.out_every is not None:
         errors.append(issue("frames", "frames and out_every are mutually exclusive"))
@@ -230,6 +234,8 @@ def resolve(req, nx, ny, settings, available_bytes, nz=1, source_units="1"):
     count = 1 + (req.steps + every - 1) // every
     coordinates = nx + ny + (nz if nz > 1 else 0) + count
     size = header_extent(source_units) + 8 * (nx * ny * nz * count + coordinates)
+    memory = estimate_engine_memory(nx, ny, nz, ranks, wind_components)
+    capacity = settings.engine_memory_capacity()
     resolved = dict(
         nx=nx,
         ny=ny,
@@ -242,7 +248,20 @@ def resolve(req, nx, ny, settings, available_bytes, nz=1, source_units="1"):
         processes=ranks,
         dt_max=dt_max,
         estimated_output_bytes=size,
+        estimated_memory_bytes=memory,
+        memory_capacity_bytes=capacity,
     )
+    if memory > capacity:
+        errors.append(
+            issue(
+                "source",
+                f"Needs about {Decimal(memory) / 10**9:.1f} GB of memory; "
+                f"this server can give the engine {Decimal(capacity) / 10**9:.1f} GB. "
+                "Use fewer layers or a smaller grid.",
+            )
+        )
+    elif errors:
+        resolved = None
     warnings = (
         [
             "Estimated output and staged input exceed available disk space "
@@ -259,7 +278,7 @@ def resolve(req, nx, ny, settings, available_bytes, nz=1, source_units="1"):
         ok=not errors,
         errors=errors,
         warnings=warnings,
-        resolved=None if errors else resolved,
+        resolved=resolved,
     )
 
 
