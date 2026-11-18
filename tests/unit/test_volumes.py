@@ -22,8 +22,8 @@ def test_vertical_stability_defaults_and_limits(client):
         req["dt"] = limit
         r = client.post("/runs/validate", json=req).json()["resolved"]
         assert r["dt_max"] == limit
-        assert (
-            r["estimated_output_bytes"] == 4096 + 8 * 7 * 5 * 3 * r["expected_frames"]
+        assert r["estimated_output_bytes"] == 8192 + 8 * (
+            (7 * 5 * 3 + 1) * r["expected_frames"] + 7 + 5 + 3
         )
         req["dt"] = np.nextafter(limit, np.inf)
         assert not client.post("/runs/validate", json=req).json()["ok"]
@@ -48,7 +48,7 @@ def test_volume_process_grid(settings):
         resolve(req.model_copy(update={"processes": None}), 4, 4, settings, 100000, 2)[
             "resolved"
         ]["processes"]
-        == 16
+        == 1
     )
 
 

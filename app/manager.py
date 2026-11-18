@@ -2,6 +2,7 @@ import asyncio
 import fcntl
 import json
 import os
+import shutil
 import signal
 import threading
 from collections import deque
@@ -106,6 +107,7 @@ class RunManager:
         self.process = None
         self.active = None
         self.exports = {}
+        self.encoding_run = None
         self.closing = False
         self.worker_write_failed = False
         self.nowcasts = Nowcasts(self, ACTIVE)
@@ -120,13 +122,21 @@ class RunManager:
             marker = self.settings.data / ".implicit-fill-upgraded"
             upgrade_uploads = not marker.exists()
             for field in self.fields.records.values():
+                if "name" not in field:
+                    fallback = "original.nc" if field["source"] == "upload" else "drawn"
+                    self.fields.update(
+                        field, name=field.get("_original_name", fallback)
+                    )
                 if upgrade_uploads and field["source"] == "upload":
                     meta = await asyncio.to_thread(
                         netcdf.inspect_field, self.field_path(field)
                     )
                     self.fields.update(field, **meta)
                     continue
-                if any("nz" not in var for var in field["variables"]):
+                if any(
+                    "spacing" not in var or "nz" not in var
+                    for var in field["variables"]
+                ):
                     await asyncio.to_thread(
                         netcdf.upgrade_field, self.field_path(field), field
                     )
@@ -135,12 +145,23 @@ class RunManager:
                 marker.touch()
             self.runs.load()
             for run in sorted(self.runs.records.values(), key=lambda r: r["_order"]):
+                request = run["request"]
+                if "units" not in request or "name" not in run:
+                    field = self.fields.records.get(request["source"].get("field_id"))
+                    self.runs.update(
+                        run,
+                        name=run.get("name")
+                        or self.run_name(request, field, run["created_at"]),
+                        _source_units=self.source_units(request, field),
+                        request={"units": models.Units.grid().model_dump(), **request},
+                    )
                 run["resolved"].setdefault("nz", 1)
                 run["resolved"].setdefault("dz", 1.0)
                 self.sequence = max(run["_order"], self.sequence)
                 directory = self.runs.root / run["id"]
                 for partial in directory.glob("export-*.partial.*"):
                     partial.unlink()
+                self.runs.measure(run["id"])
                 if run["status"] == "running":
                     await asyncio.to_thread(reap_remaining, process_tree(directory))
                     # A crash can interrupt creation of result.nc itself.
@@ -210,6 +231,7 @@ class RunManager:
                     for path in (self.runs.root / run["id"]).iterdir():
                         if path.name != "metadata.json":
                             path.unlink()
+                    self.runs.measure(run["id"])
         for item in list(self.fields.records.values()):
             if item["id"] in pinned_fields:
                 continue
@@ -281,14 +303,55 @@ class RunManager:
             id=identifier,
             source=source,
             name=name,
-            size_bytes=(directory / "original.nc").stat().st_size,
+            _original_name=name,
             created_at=now.isoformat(),
             last_used_at=now.isoformat(),
             state="active",
             expires_at=(now + ACTIVE).isoformat(),
         )
         self.fields.publish(directory, item)
-        return item
+        return self.field_view(item)
+
+    def field_view(self, item):
+        return {k: v for k, v in item.items() if not k.startswith("_")} | {
+            "size_bytes": self.fields.sizes[item["id"]]
+        }
+
+    @staticmethod
+    def run_name(request, field, created_at):
+        if "name" in request:
+            return request["name"]
+        source = request["source"]
+        if source["kind"] == "preset":
+            label = source["preset"].replace("_", " ").capitalize()
+        else:
+            label = field["name"] if field else source["field_id"]
+        suffix = f" · {datetime.fromisoformat(created_at):%d %b %H:%M}"
+        return label[: 120 - len(suffix)] + suffix
+
+    def sample_writers(self):
+        for identifier in {self.active, self.encoding_run} - {None}:
+            self.runs.measure(identifier)
+
+    def storage_usage(self):
+        self.sample_writers()
+        layers = sum(
+            self.runs.sizes[r["id"]]
+            for r in self.runs.records.values()
+            if r.get("_layer")
+        )
+        runs = sum(self.runs.sizes.values()) - layers
+        nowcasts = sum(self.nowcasts.records.sizes.values()) + layers
+        fields = sum(self.fields.sizes.values())
+        volume = shutil.disk_usage(self.settings.data)
+        return dict(
+            runs_bytes=runs,
+            fields_bytes=fields,
+            nowcasts_bytes=nowcasts,
+            used_bytes=runs + fields + nowcasts,
+            free_bytes=volume.free,
+            total_bytes=volume.total,
+        )
 
     def field_path(self, item):
         return self.fields.root / item["id"] / "original.nc"
@@ -315,7 +378,15 @@ class RunManager:
             nz = max(layers, src.replicate_z)
         else:
             nx, ny, nz = src.nx, src.ny, src.nz
-        report = resolve(req, nx, ny, self.settings, self.disk.available, nz)
+        report = resolve(
+            req,
+            nx,
+            ny,
+            self.settings,
+            self.disk.available,
+            nz,
+            (var.get("units") or "1") if item else "1",
+        )
         if validate and item is not None:
             try:
                 netcdf.prepare_input(self.field_path(item), item, src, self.disk)
@@ -362,6 +433,7 @@ class RunManager:
         if not report["ok"]:
             raise HTTPException(422, report["errors"])
         resolved = report["resolved"]
+        layer = wind_limit is not None and identifier is not None
         with self.runs.staging(identifier) as (identifier, staging):
             directory = self.runs.root / identifier
             if item is None:
@@ -411,16 +483,23 @@ class RunManager:
                 resolved["dt_max"] = wind_limit
             (staging / "config.yaml").write_text(yaml.safe_dump(config))
             self.sequence += 1
+            request = req.model_dump(exclude_unset=True) | {
+                "units": req.units.model_dump()
+            }
+            created_at = self.clock().isoformat()
             run = dict(
                 id=identifier,
+                name=self.run_name(request, item, created_at),
+                _layer=layer,
+                _source_units=self.source_units(request, item),
                 _order=self.sequence,
                 _wind_limit=wind_limit,
                 status="queued",
-                created_at=self.clock().isoformat(),
+                created_at=created_at,
                 started_at=None,
                 finished_at=None,
                 expires_at=None,
-                request=req.model_dump(exclude_unset=True),
+                request=request,
                 resolved=resolved,
                 step=0,
                 time=0.0,
@@ -437,13 +516,34 @@ class RunManager:
         self.wake.set()
         return self.view(run)
 
+    @staticmethod
+    def source_units(request, field):
+        if field:
+            name = request["source"].get("var", field["default_var"])
+            return next(
+                (
+                    v.get("units") or "1"
+                    for v in field["variables"]
+                    if v["name"] == name
+                ),
+                "1",
+            )
+        return "1"
+
+    def run_size(self, run):
+        return 0 if run["status"] == "expired" else self.runs.sizes[run["id"]]
+
     def view(self, run):
         position = (
             self.queue.index(run["id"]) + 1 if run["status"] == "queued" else None
         )
         return {
             k: v
-            for k, v in dict(run, queue_position=position).items()
+            for k, v in dict(
+                run,
+                queue_position=position,
+                size_bytes=self.run_size(run),
+            ).items()
             if not k.startswith("_")
         }
 
@@ -520,6 +620,19 @@ class RunManager:
                 self.worker_write_failed = True
                 await asyncio.sleep(0.25)
 
+    @staticmethod
+    def engine_environment(run):
+        # Reserve header space so finalising the CF coordinates can leave
+        # the complete frame array at its original offset.
+        alignment = models.header_extent(run.get("_source_units", "1"))
+        hints = [
+            h
+            for h in os.environ.get("PNETCDF_HINTS", "").split(";")
+            if h and not h.strip().startswith("nc_record_align_size=")
+        ]
+        hints.append(f"nc_record_align_size={alignment}")
+        return {**os.environ, "PNETCDF_HINTS": ";".join(hints)}
+
     async def run_next(self):
         with ExitStack() as writes:
             async with self.lock:
@@ -563,6 +676,7 @@ class RunManager:
                         proc = await asyncio.create_subprocess_exec(
                             *args,
                             cwd=directory,
+                            env=self.engine_environment(run),
                             start_new_session=True,
                             stdout=log,
                             stderr=log,
@@ -584,6 +698,7 @@ class RunManager:
                 and info.get("status") == "done"
                 and run["frames"] == run["resolved"]["expected_frames"]
             ):
+                await self.annotate_result(run)
                 return None
             if info.get("message"):
                 return info["message"]
@@ -594,6 +709,14 @@ class RunManager:
             return f"{message}\n{tail}" if tail else message
         except (OSError, RuntimeError, ValueError, IndexError, KeyError) as exc:
             return f"Cannot read engine output: {exc}"
+
+    async def annotate_result(self, run):
+        field = self.fields.records.get(run["request"]["source"].get("field_id"))
+        units = run.get("_source_units") or self.source_units(run["request"], field)
+        await finish_thread(
+            netcdf.annotate_result, self.runs.root / run["id"] / "result.nc", run, units
+        )
+        run["_cf_units"] = True
 
     async def stop_process(self):
         proc = self.process
@@ -647,7 +770,13 @@ class RunManager:
 
     async def encode_export(self, *args):
         async with self.export_slot:
-            await finish_thread(encode, *args)
+            identifier = args[0].name
+            self.encoding_run = identifier
+            try:
+                await finish_thread(encode, *args)
+            finally:
+                self.encoding_run = None
+                self.runs.measure(identifier)
 
     def export(self, run, fmt, fps, style, view):
         directory = self.runs.root / run["id"]

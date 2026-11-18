@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic.types import StringConstraints
 
 Boundary = Literal["dirichlet", "neumann", "periodic"]
 Preset = Literal["gaussian_hotspot", "constant_zero"]
@@ -57,7 +58,27 @@ class BoundaryConfig(RequestModel):
     back: Boundary = "dirichlet"
 
 
+DisplayName = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)
+]
+
+
+class RenameRequest(RequestModel):
+    name: DisplayName
+
+
+class Units(RequestModel):
+    length: Literal["cell", "m", "km"]
+    time: Literal["t", "s", "h"]
+
+    @classmethod
+    def grid(cls):
+        return cls(length="cell", time="t")
+
+
 class RunRequest(RequestModel):
+    units: Units = Field(default_factory=Units.grid)
+    name: DisplayName | None = None
     source: Annotated[FieldSource | PresetSource, Field(discriminator="kind")]
     dt: float = Field(gt=0)
     steps: int = Field(ge=1, le=ENGINE_INT_MAX)
@@ -150,7 +171,22 @@ def initial_bytes(source, nx, ny, nz):
     return 4096 + 8 * nx * ny * layers
 
 
-def resolve(req, nx, ny, settings, available_bytes, nz=1):
+def automatic_processes(nx, ny, nz, cpu_count):
+    """Allow one rank per 131,072 cells (at least one), capped by cpu_count.
+    Reduce until the engine can factor the ranks across the spatial axes.
+    """
+    ranks = min(cpu_count, max(1, nx * ny * nz // 131072))
+    while not fits(ranks, nx, ny, nz):
+        ranks -= 1
+    return ranks
+
+
+def header_extent(source_units):
+    """PnetCDF alignment for the engine header and the added CF descriptors."""
+    return 4096 * (1 + (len(source_units.encode()) + 4095) // 4096)
+
+
+def resolve(req, nx, ny, settings, available_bytes, nz=1, source_units="1"):
     errors = []
     if req.frames is not None and req.out_every is not None:
         errors.append(issue("frames", "frames and out_every are mutually exclusive"))
@@ -183,9 +219,7 @@ def resolve(req, nx, ny, settings, available_bytes, nz=1):
         )
     ranks = req.processes
     if ranks is None:
-        ranks = min(settings.cpu_count, nx * ny * nz)
-        while ranks > 1 and not fits(ranks, nx, ny, nz):
-            ranks -= 1
+        ranks = automatic_processes(nx, ny, nz, settings.cpu_count)
     elif ranks > settings.cpu_count or not fits(ranks, nx, ny, nz):
         errors.append(
             issue("processes", "MPI process grid must fit the grid and cpu_count")
@@ -194,7 +228,8 @@ def resolve(req, nx, ny, settings, available_bytes, nz=1):
     intervals = (req.frames or 101) - 1
     every = req.out_every or ((req.steps + intervals - 1) // intervals)
     count = 1 + (req.steps + every - 1) // every
-    size = 4096 + 8 * nx * ny * nz * count
+    coordinates = nx + ny + (nz if nz > 1 else 0) + count
+    size = header_extent(source_units) + 8 * (nx * ny * nz * count + coordinates)
     resolved = dict(
         nx=nx,
         ny=ny,
@@ -232,6 +267,7 @@ class NowcastParams(RequestModel):
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
     radius_km: float = Field(300, ge=50, le=1000)
+    window: Literal["now", "tonight"] = "now"
     hours: int = Field(6, ge=1, le=12)
     resolution: int = Field(96, ge=16, le=256)
     blend_tau_hours: float = Field(DEFAULT_BLEND_TAU_HOURS, gt=0)

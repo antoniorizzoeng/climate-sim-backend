@@ -142,3 +142,23 @@ def test_cli_rejects_unfinished_record(tmp_path, monkeypatch, capsys):
         nowcast_skill.main()
     assert error.value.code == 2
     assert "A completed nowcast" in capsys.readouterr().err
+
+
+def test_cli_from_repository_without_pythonpath(tmp_path):
+    import os
+    import subprocess
+    from pathlib import Path
+
+    record = tmp_path / "metadata.json"
+    record.write_text(json.dumps({"status": "running", "site": None}))
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "scripts/nowcast_skill.py", str(record)],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "A completed nowcast with site data is required" in result.stderr

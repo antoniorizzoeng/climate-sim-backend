@@ -15,7 +15,7 @@ from fastapi import Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import netcdf
+from . import catalog, models, netcdf
 from .disk import CHUNK_BYTES, DiskSpaceError
 from .image_memory import ImageTooLarge
 from .manager import lookup
@@ -165,17 +165,23 @@ M = Depends(manager)
 
 
 @router.get("/health", responses={503: {}})
-async def health(m=M):
+async def health(request: Request, m=M):
     if m.worker.done() or m.worker_write_failed:
         raise HTTPException(503, "Run worker unavailable")
     return JSONResponse(
-        dict(status="ok", engine=m.description),
+        dict(status="ok", engine=m.description, api_version=request.app.version),
         headers={
             "X-Queue-Length": str(len(m.queue)),
             "X-Active-Run-Id": m.active or "",
             "X-Disk-Free-Bytes": str(m.disk.free),
         },
     )
+
+
+@router.get("/storage")
+async def storage(m=M):
+    async with m.lock:
+        return m.storage_usage()
 
 
 @router.get("/config")
@@ -212,13 +218,33 @@ async def drawn(request: Request, m=M):
 
 
 @router.get("/fields", responses={422: {}})
-async def list_fields(params=Depends(page_params), m=M):
-    return paginate(m.fields, params)
+async def list_fields(params=Depends(catalog.query), m=M):
+    async with m.lock:
+        return catalog.page(
+            "fields",
+            m.fields.records.values(),
+            params,
+            lambda item: m.fields.sizes[item["id"]],
+            m.field_view,
+        )
 
 
 @router.get("/fields/{fieldId}", responses={404: {}})
 async def get_field(fieldId: str, m=M):
-    return lookup(m.fields, fieldId)
+    async with m.lock:
+        return m.field_view(lookup(m.fields, fieldId))
+
+
+@router.patch("/fields/{fieldId}", responses={404: {}, 422: {}})
+async def rename_field(fieldId: str, req: models.RenameRequest, m=M):
+    async with m.lock:
+        field = lookup(m.fields, fieldId)
+        m.fields.update(
+            field,
+            name=req.name,
+            _original_name=field.get("_original_name", field["name"]),
+        )
+        return m.field_view(field)
 
 
 @router.delete("/fields/{fieldId}", status_code=204, responses={404: {}, 409: {}})
@@ -235,7 +261,9 @@ async def delete_field(fieldId: str, m=M):
 async def original(fieldId: str, m=M):
     async with m.lock:
         item = lookup(m.fields, fieldId)
-        name = item["name"] + (".nc" if item["source"] == "drawn" else "")
+        name = item.get("_original_name", item["name"]) + (
+            ".nc" if item["source"] == "drawn" else ""
+        )
         return Download(m.field_path(item), name, "application/x-netcdf")
 
 
@@ -326,17 +354,33 @@ async def run_view(m, run):
 
 
 @router.get("/runs", responses={422: {}})
-async def list_runs(params=Depends(page_params), m=M):
+async def list_runs(params=Depends(catalog.query), m=M):
     async with m.lock:
-        page = paginate(m.runs, params)
-        page["items"] = [await run_view(m, r) for r in page["items"]]
-        return page
+        m.sample_writers()
+        if m.active:
+            await m.refresh(m.runs.records[m.active])
+        return catalog.page(
+            "runs",
+            (run for run in m.runs.records.values() if not run.get("_layer")),
+            params,
+            m.run_size,
+            m.view,
+        )
 
 
 @router.get("/runs/{runId}", responses={404: {}})
 async def get_run(runId: str, m=M):
     async with m.lock:
+        m.sample_writers()
         return await run_view(m, lookup(m.runs, runId))
+
+
+@router.patch("/runs/{runId}", responses={404: {}, 422: {}})
+async def rename_run(runId: str, req: models.RenameRequest, m=M):
+    async with m.lock:
+        run = lookup(m.runs, runId)
+        m.runs.update(run, name=req.name)
+        return await run_view(m, run)
 
 
 @router.delete("/runs/{runId}", status_code=204, responses={404: {}})
@@ -428,7 +472,10 @@ def completed(runId: str, m=M):
 @router.get("/runs/{runId}/result.nc", responses={404: {}, 409: {}})
 async def result(runId: str, m=M):
     async with m.lock:
-        completed(runId, m)
+        run = completed(runId, m)
+        if not run.get("_cf_units"):
+            await m.annotate_result(run)
+            m.runs.update(run, _cf_units=True)
         return Download(
             m.runs.root / runId / "result.nc", f"{runId}.nc", "application/x-netcdf"
         )
@@ -461,7 +508,7 @@ async def export(
 
 @router.post("/nowcasts", status_code=202, responses={422: {}})
 async def new_nowcast(req: NowcastParams, m=M):
-    return m.nowcasts.create(req)
+    return await m.nowcasts.create(req)
 
 
 @router.get("/nowcasts", responses={422: {}})
@@ -486,4 +533,4 @@ async def delete_nowcast(id: str, m=M):
 @router.post("/nowcasts/{id}/refresh", status_code=202, responses={404: {}})
 async def refresh_nowcast(id: str, m=M):
     previous = lookup(m.nowcasts.records, id)
-    return m.nowcasts.create(NowcastParams(**previous["params"]), fresh=True)
+    return await m.nowcasts.create(NowcastParams(**previous["params"]), fresh=True)

@@ -29,6 +29,8 @@ def saved_run(settings, clock):
     directory.mkdir(parents=True)
     record = dict(
         id=identifier,
+        created_at=clock().isoformat(),
+        request=preset(),
         _order=1,
         status="done",
         finished_at=clock().isoformat(),
@@ -179,7 +181,7 @@ def test_restart_during_export(
 def test_retention_during_active_download(saved_run, client, clock, monkeypatch):
     identifier, directory = saved_run
     original = directory / "result.nc"
-    expected = original.read_bytes()
+    expected = client.get(f"/runs/{identifier}/result.nc").content
     entered, release = threading.Event(), threading.Event()
     chunks = Download.chunks
     opened = []

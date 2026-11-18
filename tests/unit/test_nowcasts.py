@@ -68,7 +68,13 @@ def test_unavailable_and_validation(client):
     item = r.json()
     assert item["status"] == "error" and "wind.mode=file" in item["message"]
     assert item["params"] == dict(
-        lat=0, lon=0, radius_km=300, hours=6, resolution=96, blend_tau_hours=2
+        lat=0,
+        lon=0,
+        radius_km=300,
+        hours=6,
+        resolution=96,
+        blend_tau_hours=2,
+        window="now",
     )
     assert item["best_window"] is None
     assert item["site"] is None and item["layers"] == []
@@ -85,7 +91,7 @@ def test_queue_frames_comparison_refresh_delete_restart(supported, settings, clo
         url = "/nowcasts/" + r.json()["id"]
         item = await_state(c, url, "queued")
         assert item["site"] is None and item["data_time"] == clock().isoformat()
-        assert len(c.get("/runs").json()["items"]) == 3
+        assert c.get("/runs").json()["items"] == []
         assert [layer["pressure_hpa"] for layer in item["layers"]] == [850, 500, 300]
         for layer in item["layers"]:
             run = c.get("/runs/" + layer["run_id"]).json()

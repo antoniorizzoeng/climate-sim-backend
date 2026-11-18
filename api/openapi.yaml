@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: climate-sim API
-  version: 1.3.2
+  version: 1.4.0
   description: |
     Backend for the climate-sim frontend. Runs the MPI engine (climate-sim-mpi-cpp) locally with mpirun.
     Single local user, no authentication. One run executes at a time (all cores); others wait in a FIFO queue.
@@ -61,6 +61,21 @@ info:
       itself is deleted 37 days after finishing).
     - expires_at / deleted_at timestamps are returned so the UI can show them. Cleanup runs at startup and hourly.
 
+    ## Units (1.4.0)
+    The engine is unitless; units live in the API. RunRequest.units = {length, time} names the unit system of the
+    request: dx/dy/dz are lengths per cell, vx/vy/vz are length/time, D/Dz are length²/time, dt and Run.time are time.
+    Omitted units mean {length: cell, time: t} (grid units, the 1.3 behaviour). Values are passed to the engine as given
+    (no conversion is needed because every quantity uses the same system). The unit system is stored with the run,
+    echoed in Run.request.units, and written into result.nc and NetCDF exports as CF `units` attributes
+    (time: "h"/"s"/"1"; x/y/z coordinates: "km"/"m"/"1"; u: the source variable's units when known, else "1").
+    Variable.spacing reports grid spacing derived from 1-D x/y/z coordinate variables and their CF units so clients can
+    prefill dx/dy/dz (converted to the chosen length unit). Degrees are converted with the mean latitude of the plane
+    (equirectangular approximation) and flagged approximate.
+
+    ## Process count (1.4.0)
+    Clients should omit RunRequest.processes. The backend then picks the rank count itself from the grid size and
+    cpu_count (never more ranks than useful for the grid) and reports it in ResolvedRun.processes.
+
     ## Persistence and queue
     One manager owns DATA_DIR. A run's request is persisted before 202 is returned. On restart, queued runs are
     resumed; a run that was running is marked error ("interrupted by restart"). DELETE of a queued/running run stops
@@ -82,11 +97,23 @@ paths:
               schema:
                 type: object
                 additionalProperties: false
-                required: [status, engine]
+                required: [status, engine, api_version]
                 properties:
                   status: { type: string, enum: [ok] }
                   engine: { type: string, description: Engine binary path and version }
+                  api_version: { type: string, description: "info.version of this contract, e.g. 1.4.0" }
         "503": { $ref: "#/components/responses/MessageError" }
+
+  /storage:
+    get:
+      operationId: getStorage
+      summary: Disk used by stored data and free space on the data volume (single local user; per-user quotas come later).
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StorageUsage" }
 
   /config:
     get:
@@ -123,18 +150,24 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/Limit" }
         - { $ref: "#/components/parameters/Cursor" }
+        - { $ref: "#/components/parameters/Q" }
+        - { $ref: "#/components/parameters/CreatedFrom" }
+        - { $ref: "#/components/parameters/CreatedTo" }
+        - { $ref: "#/components/parameters/Sort" }
       responses:
         "200":
-          description: Most recent first
+          description: Filtered and sorted (default created_desc)
           content:
             application/json:
               schema:
                 type: object
                 additionalProperties: false
-                required: [items, next_cursor]
+                required: [items, next_cursor, total, total_bytes]
                 properties:
                   items: { type: array, items: { $ref: "#/components/schemas/Field" } }
                   next_cursor: { type: [string, "null"] }
+                  total: { type: integer, description: Number of matching items across all pages }
+                  total_bytes: { type: integer, description: Sum of size_bytes of matching items }
         "422": { $ref: "#/components/responses/ValidationError" }
 
   /fields/drawn:
@@ -175,6 +208,21 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Field" }
         "404": { $ref: "#/components/responses/MessageError" }
+    patch:
+      operationId: renameField
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RenameRequest" }
+      responses:
+        "200":
+          description: Renamed (the original filename is still used for downloads)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Field" }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "422": { $ref: "#/components/responses/ValidationError" }
     delete:
       operationId: deleteField
       responses:
@@ -272,21 +320,28 @@ paths:
         "422": { $ref: "#/components/responses/ValidationError" }
     get:
       operationId: listRuns
+      summary: User runs only. The layer runs owned by a nowcast are excluded (their bytes count in /storage under nowcasts).
       parameters:
         - { $ref: "#/components/parameters/Limit" }
         - { $ref: "#/components/parameters/Cursor" }
+        - { $ref: "#/components/parameters/Q" }
+        - { $ref: "#/components/parameters/CreatedFrom" }
+        - { $ref: "#/components/parameters/CreatedTo" }
+        - { $ref: "#/components/parameters/Sort" }
       responses:
         "200":
-          description: Most recent first
+          description: Filtered and sorted (default created_desc)
           content:
             application/json:
               schema:
                 type: object
                 additionalProperties: false
-                required: [items, next_cursor]
+                required: [items, next_cursor, total, total_bytes]
                 properties:
                   items: { type: array, items: { $ref: "#/components/schemas/Run" } }
                   next_cursor: { type: [string, "null"] }
+                  total: { type: integer, description: Number of matching items across all pages }
+                  total_bytes: { type: integer, description: Sum of size_bytes of matching items }
         "422": { $ref: "#/components/responses/ValidationError" }
 
   /runs/validate:
@@ -318,6 +373,21 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Run" }
         "404": { $ref: "#/components/responses/MessageError" }
+    patch:
+      operationId: renameRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RenameRequest" }
+      responses:
+        "200":
+          description: Renamed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "404": { $ref: "#/components/responses/MessageError" }
+        "422": { $ref: "#/components/responses/ValidationError" }
     delete:
       operationId: deleteRun
       summary: Stops mpirun if queued/running (returns after all ranks exited), then deletes the run and its files.
@@ -567,6 +637,14 @@ components:
     H: { name: h, in: query, description: Window height in cells (default to the edge), schema: { type: integer, minimum: 1 } }
     Stride: { name: stride, in: query, description: Take every stride-th cell in both axes, schema: { type: integer, minimum: 1, default: 1 } }
     Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+    Q: { name: q, in: query, description: "Case-insensitive substring match on name (and id prefix)", schema: { type: string, maxLength: 120 } }
+    CreatedFrom: { name: created_from, in: query, description: Inclusive lower bound on created_at, schema: { type: string, format: date-time } }
+    CreatedTo: { name: created_to, in: query, description: Exclusive upper bound on created_at, schema: { type: string, format: date-time } }
+    Sort:
+      name: sort
+      in: query
+      description: Ties break on id. A cursor is only valid with the same q, created_from, created_to and sort (422 otherwise).
+      schema: { type: string, enum: [created_desc, created_asc, size_desc, size_asc, name_asc, name_desc], default: created_desc }
     Cursor: { name: cursor, in: query, schema: { type: string } }
 
   responses:
@@ -680,6 +758,50 @@ components:
         extra_dims: { type: array, items: { $ref: "#/components/schemas/ExtraDim" } }
         units: { type: [string, "null"] }
         long_name: { type: [string, "null"] }
+        spacing:
+          oneOf: [{ $ref: "#/components/schemas/GridSpacing" }, { type: "null" }]
+          description: Spacing derived from 1-D coordinate variables with recognised CF units; null when unknown.
+
+    GridSpacing:
+      type: object
+      additionalProperties: false
+      required: [dx, dy, length_unit, approximate]
+      properties:
+        dx: { type: number, exclusiveMinimum: 0, description: Mean spacing along x in length_unit }
+        dy: { type: number, exclusiveMinimum: 0 }
+        dz: { type: [number, "null"], exclusiveMinimum: 0, description: Only for a vertical length coordinate (not pressure) }
+        length_unit: { type: string, enum: [m, km] }
+        approximate:
+          type: boolean
+          description: True when converted from degrees or when the coordinate spacing is non-uniform by more than 1%.
+
+    Units:
+      type: object
+      additionalProperties: false
+      required: [length, time]
+      properties:
+        length: { type: string, enum: [cell, m, km] }
+        time: { type: string, enum: [t, s, h] }
+      description: Unit system of a run request. cell/t are grid units.
+
+    RenameRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120, description: Trimmed; must not be blank }
+
+    StorageUsage:
+      type: object
+      additionalProperties: false
+      required: [used_bytes, runs_bytes, fields_bytes, nowcasts_bytes, free_bytes, total_bytes]
+      properties:
+        used_bytes: { type: integer, description: runs_bytes + fields_bytes + nowcasts_bytes }
+        runs_bytes: { type: integer }
+        fields_bytes: { type: integer, description: Active and archived fields }
+        nowcasts_bytes: { type: integer, description: Nowcast records including their layer runs }
+        free_bytes: { type: integer, description: Free space on the data volume }
+        total_bytes: { type: integer, description: Size of the data volume }
 
     PlaneStats:
       type: object
@@ -698,12 +820,12 @@ components:
     Field:
       type: object
       additionalProperties: false
-      required: [id, source, name, created_at, state, expires_at, variables, default_var, default_stats]
+      required: [id, source, name, created_at, state, expires_at, variables, default_var, default_stats, size_bytes]
       properties:
         id: { type: string }
         source: { type: string, enum: [upload, drawn] }
-        name: { type: string, description: Original filename or the drawn name }
-        size_bytes: { type: integer }
+        name: { type: string, description: Display name; initially the original filename or the drawn name; editable with PATCH }
+        size_bytes: { type: integer, description: Bytes on disk for this field (original, normalised planes, previews) }
         created_at: { type: string, format: date-time }
         last_used_at: { type: string, format: date-time }
         state: { type: string, enum: [active, archived] }
@@ -779,11 +901,18 @@ components:
         out_every: { type: integer, minimum: 1, description: "Mutually exclusive with frames" }
         frames: { type: integer, minimum: 2, description: "Frames to keep (incl. initial and final). Default 101 when neither is given." }
         bc: { $ref: "#/components/schemas/BoundaryConfig" }
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: Display name. Omitted → derived by the server (preset label or field name, plus the creation time).
+        units: { $ref: "#/components/schemas/Units" }
         processes:
           type: integer
           minimum: 1
           description: >
-            MPI ranks. Omitted → default_processes, automatically reduced so the MPI_Dims_create grid fits nx and ny.
+            MPI ranks. Clients should omit it (the web app does). Omitted → chosen by the server from the grid size and
+            cpu_count (enough cells per rank to be worth it), then reduced so the MPI_Dims_create grid fits nx and ny.
             For volumes, all ranks must fit a Cartesian factorization across nx, ny and nz.
             An explicit value that does not fit, or exceeds cpu_count, is rejected.
 
@@ -820,9 +949,11 @@ components:
     Run:
       type: object
       additionalProperties: false
-      required: [id, status, created_at, request, resolved, step, time, frames, queue_position, display_range, message, expires_at]
+      required: [id, name, status, created_at, request, resolved, step, time, frames, queue_position, display_range, message, expires_at, size_bytes]
       properties:
         id: { type: string }
+        name: { type: string, description: Display name (request.name or the server-derived default; editable with PATCH) }
+        size_bytes: { type: integer, description: Bytes on disk for this run now (frames, result.nc, exports); 0 once expired }
         status: { type: string, enum: [queued, running, done, error, expired] }
         created_at: { type: string, format: date-time }
         started_at: { type: [string, "null"], format: date-time }
@@ -855,7 +986,14 @@ components:
         lat: { type: number, minimum: -90, maximum: 90 }
         lon: { type: number, minimum: -180, maximum: 180 }
         radius_km: { type: number, minimum: 50, maximum: 1000, default: 300, description: Half the width of the square domain. }
-        hours: { type: integer, minimum: 1, maximum: 12, default: 6 }
+        hours: { type: integer, minimum: 1, maximum: 12, default: 6, description: Horizon for window=now; ignored for tonight. }
+        window:
+          type: string
+          enum: [now, tonight]
+          default: now
+          description: >
+            now: the next `hours` hours. tonight: from data_time until the end of the coming (or current) astronomical
+            night (Sun below −18°), at most 24 h ahead. 422 when the site has no astronomical darkness in the next 24 h.
         resolution: { type: integer, minimum: 16, maximum: 256, default: 96, description: Simulation cells per side. }
         blend_tau_hours:
           type: number
@@ -882,7 +1020,7 @@ components:
     Nowcast:
       type: object
       additionalProperties: false
-      required: [id, status, created_at, params, data_time, layers, site, best_window, grid, message, expires_at]
+      required: [id, status, created_at, params, data_time, layers, site, best_window, grid, night, message, expires_at]
       properties:
         id: { type: string }
         status: { type: string, enum: [fetching, queued, running, done, error] }
@@ -920,7 +1058,8 @@ components:
           additionalProperties: false
           description: >
             Longest stretch of consecutive ten-minute samples with blended clear fraction at least 0.70 and good
-            or fair seeing. Ties go to the earliest stretch. Null until done or when no sample qualifies.
+            or fair seeing. When `night` is present only samples between dusk and dawn qualify (1.4.0).
+            Ties go to the earliest stretch. Null until done or when no sample qualifies.
           required: [start, end, mean_clear, seeing]
           properties:
             start: { type: string, format: date-time, description: Time of the first qualifying sample. }
@@ -939,5 +1078,26 @@ components:
             dy_m: { type: number, description: Northward cell spacing in metres. }
             lat0: { type: number, description: Latitude of the southwest cell centre in degrees. }
             lon0: { type: number, description: Longitude of the southwest cell centre in degrees. }
+        night:
+          type: [object, "null"]
+          additionalProperties: false
+          description: >
+            Darkness and Moon for the night covered by the record (null when the site has no astronomical night in the
+            horizon). Times are UTC. Accuracy target: Sun events within 2 minutes, Moon altitude within 1°.
+          required: [dusk, dawn, moon]
+          properties:
+            dusk: { type: string, format: date-time, description: End of astronomical twilight (Sun at −18°, setting); may precede data_time. }
+            dawn: { type: string, format: date-time, description: Start of astronomical twilight (Sun at −18°, rising). }
+            moon:
+              type: array
+              description: Every 10 minutes from max(dusk, data_time) to dawn.
+              items:
+                type: object
+                additionalProperties: false
+                required: [time, altitude_deg, illumination]
+                properties:
+                  time: { type: string, format: date-time }
+                  altitude_deg: { type: number, description: Topocentric altitude of the Moon's centre, without refraction }
+                  illumination: { type: number, minimum: 0, maximum: 1, description: Illuminated fraction of the disc }
         message: { type: [string, "null"] }
         expires_at: { type: string, format: date-time, description: Seven days from completion for a terminal record. }

@@ -172,7 +172,7 @@ def test_recovery_after_server_sigkill(engine_settings, tmp_path):
 
     settings = engine_settings
     with socket.socket() as sock, (tmp_path / "server.log").open("wb") as log:
-        sock.bind(("127.0.0.1", 0))
+        sock.bind(("127.0.0.1", int(os.environ.get("TEST_SERVER_PORT", 0))))
         sock.listen()
         endpoint = f"http://127.0.0.1:{sock.getsockname()[1]}"
         env = dict(
@@ -366,3 +366,85 @@ def test_worker_retries_metadata_write_in_fifo_order(live, monkeypatch, transiti
         wait_run(live, identifier)
     assert starts == finishes == [first, second]
     assert live.get("/health").json()["status"] == "ok"
+
+
+def test_cf_download_sizes_and_retention(live, clock, tmp_path, monkeypatch):
+    from app import netcdf
+    from tests.unit.test_catalog import disk_bytes
+    from tests.unit.test_lifecycle import clean
+
+    m = live.app.state.manager
+    annotate = netcdf.annotate_result
+    layout = {}
+
+    def inspect_engine_output(path, run, units):
+        with netcdf.dataset(path) as ds:
+            assert ds.dimensions["time"].isunlimited()
+            frame_bytes = ds["u"].size * 8
+        with path.open("rb") as stream:
+            layout["offset"] = stream.seek(-frame_bytes, 2)
+            layout["payload"] = stream.read()
+        annotate(path, run, units)
+
+    monkeypatch.setattr(netcdf, "annotate_result", inspect_engine_output)
+    path = tmp_path / "temp.nc"
+    with netCDF4.Dataset(path, "w") as ds:
+        for axis in ("z", "y", "x"):
+            ds.createDimension(axis, 4)
+        u = ds.createVariable("temperature", "f8", ("z", "y", "x"))
+        u.units = "K"
+        u[:] = np.arange(64).reshape(4, 4, 4)
+    field = live.post("/fields", files={"file": ("temp.nc", path.read_bytes())}).json()
+    assert field["size_bytes"] == disk_bytes(m.fields.root)
+    body = dict(
+        source=dict(kind="field", field_id=field["id"], volume=True),
+        dt=0.2,
+        steps=5,
+        out_every=2,
+        units={"length": "km", "time": "h"},
+        dx=0.25,
+        dy=0.75,
+        dz=1.5,
+        name="  All levels  ",
+    )
+    run = wait_run(live, live.post("/runs", json=body).json()["id"])
+    url = "/runs/" + run["id"]
+    assert run["name"] == run["request"]["name"] == "All levels"
+    assert run["request"]["units"] == body["units"]
+    assert run["size_bytes"] == disk_bytes(m.runs.root)
+    path.write_bytes(live.get(url + "/result.nc").content)
+    with path.open("rb") as stream:
+        stream.seek(layout["offset"])
+        assert stream.read(len(layout["payload"])) == layout["payload"]
+    with netCDF4.Dataset(path) as ds:
+        assert not ds.dimensions["time"].isunlimited()
+        assert [ds[k].units for k in ("time", "z", "y", "x", "u")] == [
+            "h",
+            "km",
+            "km",
+            "km",
+            "K",
+        ]
+        np.testing.assert_allclose(ds["time"][:], [0, 0.4, 0.8, 1])
+        for axis in ("z", "y", "x"):
+            np.testing.assert_allclose(ds[axis][:], np.arange(4) * body["d" + axis])
+        np.testing.assert_array_equal(ds["u"][0], np.arange(64).reshape(4, 4, 4))
+    ep = url + "/export.gif"
+    poll(live, ep, lambda r: r.status_code == 200)
+    assert (
+        live.get(url).json()["size_bytes"]
+        == disk_bytes(m.runs.root)
+        > run["size_bytes"]
+    )
+    assert live.get("/runs").json()["total_bytes"] == disk_bytes(m.runs.root)
+    storage = live.get("/storage").json()
+    assert storage["used_bytes"] == disk_bytes(m.runs.root) + disk_bytes(m.fields.root)
+    assert 0 < storage["free_bytes"] <= storage["total_bytes"]
+    clock.advance(7)
+    clean(live)
+    assert live.get(url).json()["size_bytes"] == 0
+    storage = live.get("/storage").json()
+    assert storage["runs_bytes"] == disk_bytes(m.runs.root)
+    assert storage["fields_bytes"] == disk_bytes(m.fields.root)
+    assert live.delete(url).status_code == 204
+    assert live.get("/storage").json()["runs_bytes"] == 0
