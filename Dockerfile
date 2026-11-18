@@ -4,8 +4,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 ARG ENGINE_REF=main
 WORKDIR /src
-RUN curl -fsSL "https://codeload.github.com/antoniorizzoeng/climate-sim-mpi-cpp/tar.gz/${ENGINE_REF}" \
-    | tar xz --strip-components=1 \
+# ADD re-downloads remote archives on every build and only reuses the cache when
+# the content is unchanged, so a moved branch such as main rebuilds the engine.
+ADD "https://codeload.github.com/antoniorizzoeng/climate-sim-mpi-cpp/tar.gz/${ENGINE_REF}" /tmp/engine.tar.gz
+RUN tar xzf /tmp/engine.tar.gz --strip-components=1 \
     && cmake -S . -B build -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build --target climate_sim --parallel 2
 
