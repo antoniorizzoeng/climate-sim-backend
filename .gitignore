@@ -53,3 +53,6 @@ docker-data/
 # Local simulation state and reports
 data/
 coverage.xml
+
+/artifacts/
+artifacts/

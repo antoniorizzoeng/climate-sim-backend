@@ -1,90 +1,124 @@
-# climate-sim backend
+# ![ClimateSim — Simulation API](docs/assets/banner.svg)
 
-A single-user FastAPI service for uploading NetCDF fields, running the local MPI simulator, reading live frames and exporting animations. The API contract is [api/openapi.yaml](api/openapi.yaml). A running service serves the contract at `/openapi.json` and interactive documentation at `/docs`.
+**Submit a field once, watch its frames arrive over HTTP, and take the whole run home as NetCDF.**
 
-## Local development
+[![CI status](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/ci.yml)
+[![CodeQL status](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/codeql.yml/badge.svg)](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/codeql.yml)
+[![License AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-52475e)](LICENSE)
+[![API version 1.3.0](https://img.shields.io/badge/API-1.3.0-9c523c)](api/openapi.yaml)
 
-Install Python 3.12 with venv support, Open MPI and ffmpeg with libx264. Build the [MPI engine](https://github.com/antoniorizzoeng/climate-sim-mpi-cpp) with CMake, PnetCDF, NetCDF-C and yaml-cpp. Point the backend at the resulting executable.
+<p align="center">
+  <img src="docs/assets/braid-projection.gif" width="820" alt="Three gold and violet tracer filaments travel across a periodic volume, seen in maximum projection."/>
+  <br/>
+  <em>Maximum along z · 512 × 156 × 20 cells · two MPI ranks · plasma</em>
+</p>
 
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt
-export ENGINE_BIN="$HOME/climate-sim/climate-sim-mpi-cpp/build/src/climate_sim"
-export MPIRUN_ARGS=--oversubscribe
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
-```
+## Why
 
-Use one API process per data directory. The manager enforces exclusive ownership, runs jobs in submission order and serves independent requests during MPI execution and encoding. On restart it resumes queued jobs and marks interrupted simulations as errors.
+A browser can ask for a single pixel while the solver is still writing the next frame. This single-user FastAPI service owns the queue, snapshot files and encoders so every client can work with the same run ID.
 
-## Docker Compose
+| Start a run | Read a run |
+| --- | --- |
+| **Inputs** · Upload NetCDF, send a drawn float32 plane, or start from a preset. Select a variable, an indexed plane or a full volume. | **Frames** · Request a PNG, float32 window or 3D volume. Choose an axis for slices and maximum or mean projections. |
+| **Queue** · Validate grid, stability, ranks and free space. One local worker launches MPI jobs in submission order. | **Exports** · Download the original CDF-5 output, or encode an MP4 or GIF with the chosen range, view, colormap and frame rate. |
 
-```bash
+## Quick start
+
+From this checkout, start the API and its MPI engine with Docker Compose. The first build needs network access. Port 8000 must be free.
+
+```sh
 docker compose up --build
 ```
 
-Open http://localhost:8000/docs. The image builds the simulator from the engine repository at main and includes Open MPI and ffmpeg. Compose mounts the named `simulations` volume at `/data`. The service listens on the host loopback interface. Use `docker compose down` to stop it and preserve simulation data.
+With the service running, submit a drifting hotspot from a second terminal.
 
-## Settings
-
-| Variable | Default for local execution | Purpose |
-| --- | --- | --- |
-| DATA_DIR | ./data | Persistent fields, requests, output and exports. |
-| ENGINE_BIN | climate_sim on PATH | Engine executable, optionally an absolute path. Health reports the CMake package version when available and identifies the binary by a SHA-256 fingerprint. |
-| MPIRUN | mpirun | Local MPI launcher. |
-| MPIRUN_ARGS | empty | Additional shell-quoted launcher arguments, e.g. --oversubscribe. Compose defaults to --oversubscribe. |
-| CORS_ORIGINS | http://localhost:3000 | Comma-separated browser origins. |
-| DISK_SAFETY_MARGIN_BYTES | 2147483648 (2 GiB) | Free space to keep on the data filesystem. |
-| ENGINE_PERIODIC | 1 | Advertise periodic boundaries when the installed engine passes the startup wrap-around probe. Set to 0 to disable them. |
-
-The service logs one JSON line per request and simulation state change. `GET /health` reports `X-Queue-Length`, `X-Active-Run-Id` (empty when idle), and `X-Disk-Free-Bytes` in response headers.
-
-Uploads are streamed into the data directory. The service checks declared NetCDF-4 sizes before decoding and rejects writes that would consume the disk reserve. `POST /runs/validate` reports space estimates in `warnings`. The run is checked again at submission and when the engine starts, since available space can change while it is queued.
-
-## Run and retrieve a simulation
-
-```bash
-curl -s http://localhost:8000/runs -H 'Content-Type: application/json' -d '{
-  "source":{"kind":"preset","preset":"gaussian_hotspot","nx":32,"ny":16},
-  "processes":2, "dt":0.1, "D":0.2, "steps":25, "frames":8
+```sh
+curl -fsS http://localhost:8000/runs -H 'Content-Type: application/json' -d '{
+  "source":{"kind":"preset","preset":"gaussian_hotspot","nx":64,"ny":32},
+  "processes":2,"dt":0.2,"D":0.1,"vx":1,"steps":60,"frames":7
 }'
 ```
 
-Poll `/runs/{id}` for the readable frame count. Frame indices start at zero. Fetch `/runs/{id}/frames/0.png` for an image or `/runs/{id}/frames/0/values` for little-endian float32 cells starting with the bottom row. After completion, download `/runs/{id}/result.nc` or poll `/runs/{id}/export.mp4`, respecting the Retry-After header. GIF exports use the same interface.
+Copy the returned `id` into **GET /runs/{runId}** in the interactive docs. When `frames` reaches 7, request frame 6 for the final image. Compose stores the data in the `simulations` volume. [Interactive API on localhost](http://localhost:8000/docs) · [Versioned OpenAPI contract](api/openapi.yaml)
 
-Fields remain active for seven days from last use and archived for another thirty. Archived originals remain downloadable and starting a run reactivates the field. Run outputs expire seven days after completion. A run can be repeated until its record expires on day 37 if the source is still available. Cleanup runs on startup and hourly.
+## How a request reaches the solver
 
-## Checks
-
-```bash
-flake8 app tests
-pytest -q
+```mermaid
+flowchart TB
+  subgraph submit["Submit a field"]
+    direction LR
+    B["Browser"] --> A["FastAPI"] --> Q["Run queue"] --> M["mpirun"]
+  end
+  subgraph read["Read a result"]
+    direction LR
+    N["CDF-5 snapshots"] --> R["Renderer"]
+    R --> P["PNG or float32"]
+    R --> F["ffmpeg · GIF or MP4"]
+  end
+  submit -->|"collective write"| read
 ```
 
-For the opt-in live data check, run `RUN_NETWORK_TESTS=1 pytest -m network --no-cov`. Test dependencies include pytest-cov. CI enforces 90% branch-inclusive coverage and builds the engine from main for the integration tests. The local suite looks for ENGINE_BIN or the development build shown above. It reports a skip reason if the executable is missing.
-
-See [the rendering benchmark](docs/performance.md) for timings and reproduction steps.
+One API process holds the data-directory lock. It serves completed frames while a simulation or export continues. On restart, queued jobs resume and interrupted simulations receive an error status. The queue length, active run ID and free space are available in health-response headers.
 
 ## Sky nowcast
 
-Post `{"lat":45,"lon":10}` to `/nowcasts` and poll the returned ID. The default models six hours on a 96 × 96 grid extending 300 km in each direction. The three layer IDs open ordinary run frames, PNGs and exports. Refresh creates a separate forecast with fresh data. Nowcasts expire seven days after completion.
+![Live Sky workspace showing the blended clear-sky forecast and hourly seeing at Roque de los Muchachos](docs/assets/sky.webp)
 
-Open-Meteo supplies the initial cloud cover and hourly winds. Only the site and grid coordinates, requested variables and UTC hours are sent, with a generic User-Agent. All simulation data stays local. The client caches responses for an hour, batches up to 64 points, and counts locations and variables against the free non-commercial quota. [Forecast API](https://open-meteo.com/en/docs) · [Rate limits](https://open-meteo.com/en/pricing)
+At **Roque de los Muchachos**, the curves begin together and then diverge as the wind carries clouds across the site. The screenshot is a saved six-hour forecast. Its highlighted observing window belongs to that forecast time.
 
-Weather samples span the outer simulation cell centres on an odd regular grid capped at 17 × 17. Sample spacing is about 37 km at the default radius and 125 km at the largest radius. Bilinear interpolation supplies the engine grid. Row zero is south. Low, mid and high clouds follow winds at 850, 500 and 300 hPa, respectively. Meteorological “from” directions become east/north velocities in m/s (1 m/s = 3.6 km/h). Each layer uses zero-gradient boundaries, diffusion of 10 m²/s and a timestep at most 90% of the combined advection–diffusion stability limit. Frames are ten minutes apart.
+1. **Transport.** Open-Meteo supplies low, mid and high cloud cover and winds at 850, 500 and 300 hPa. Three MPI runs transport the layers across a local grid with zero-gradient edges. The default grid is 96² over 600 km. Frames are ten minutes apart.
+2. **Blend.** The site timeline combines transported cover with the hourly model forecast. The transport weight is `exp(−t/τ)` for lead time `t`. With the default `τ = 2 h`, transport supplies about 37% after two hours. Layer overlap is treated as random when computing the transported total.
+3. **Observing window.** The longest stretch with at least 70% blended clear sky and good or fair seeing wins. The earliest stretch wins a tie. Seeing comes from 250 hPa wind speed alone, and local turbulence can dominate.
 
-The timeline contains the transported cloud fractions (`nowcast`), Open-Meteo's site forecast interpolated from hourly values (`model`), and their `blend`. Transport omits cloud formation, dissipation and vertical motion, and clouds arriving from beyond the grid are unknown. The blend starts at 100% transport and increases the model's share with lead time. For each layer and for total cloud cover, the transport weight is `exp(-t / τ)`, where `t` is hours since `data_time`. Pass a positive `blend_tau_hours` in the request to change τ. The default is 2 hours, when transport contributes about 37%. The transport total uses random overlap and the model total comes from Open-Meteo. Blended clear is one minus blended total. A startup probe checks engine wind-file support before any forecast is fetched.
+The solver omits cloud formation, dissipation and vertical motion. Incoming cloud beyond the finite grid is unknown. The only location data in the weather request are the site and surrounding grid coordinates. Open-Meteo also receives the requested variables and UTC hours. Site names, uploaded fields and simulation results stay local. [Open-Meteo forecast variables](https://open-meteo.com/en/docs) · [Saved-forecast evaluation against later model estimates](scripts/nowcast_skill.py)
 
-The hourly 250 hPa wind gives a seeing rule of thumb (good below 20 m/s, fair from 20 through 35, poor above 35). Local turbulence can dominate. `best_window` reports the longest stretch of consecutive samples with at least 70% blended clear sky and good or fair seeing. It includes the first and last qualifying timestamps, mean clear fraction, and worst seeing category in the stretch. Ties favor the earliest stretch. If no sample qualifies, the window is null.
+## Performance
 
-On startup, the backend fills in the default τ, blend and best window for older saved nowcasts using their stored site data.
+A native 4096² PNG fell from **1,467 to 298 ms** in the rendering benchmark. Reading a strided window of values fell from **63.46 to 7.14 ms**. Fetching an entire float32 plane still transfers 64 MiB and took slightly longer after the change.
 
-### Check a saved nowcast
+![Median response time before and after the renderer update, for native PNG, downscaled PNG, full values and windowed values](docs/assets/frame-latency.svg)
 
-Once the final reference hour is past, run the following from the repository root with either a saved `GET /nowcasts/{id}` response or the nowcast's `DATA_DIR/nowcasts/{id}/metadata.json`.
+Nine warm requests per case, one logical CPU on a Ryzen 5 8500G, in-process FastAPI client. Network latency, MPI stepping and movie encoding are outside these timings. [Benchmark data and setup](docs/performance.md) · [Chart generator](scripts/readme_chart.py)
 
-```bash
-python -m scripts.nowcast_skill path/to/nowcast.json
-```
+## API reference
 
-The script makes one Open-Meteo request for hourly low, mid, high, and total cloud cover at the site. It uses `past_hours` for the last 24 hours and `past_days` for older records within the API's 92-day limit. The past hours reflect the latest model initialization available for each valid hour and serve as a proxy for actual conditions. Give the provider time to ingest a newer model run before evaluating. The script interpolates between adjacent reference hours to align with the ten-minute site samples and reports mean absolute error in percentage points for each series. All three scores use the same matched samples, and the output shows how many matched. [Open-Meteo Forecast API](https://open-meteo.com/en/docs)
+| Request | Result |
+| --- | --- |
+| `POST /fields` · `POST /fields/drawn` | Stored field ID and metadata for an upload or a bottom-row-first drawing. |
+| `POST /runs/validate` · `POST /runs` | Resolved settings and warnings, or a queued run. Poll `GET /runs/{runId}` for readable frames. |
+| `GET /runs/{runId}/frames/{n}.png` | Zero-based frame. Set `colormap`, `vmin` and `vmax`, and optionally `max_side`. |
+| `GET /runs/{runId}/frames/{n}/values` · `…/volume` | Little-endian float32 plane or volume. Window and stride the plane, or read a 3D grid. |
+| `GET /runs/{runId}/result.nc` · `…/export.gif` · `…/export.mp4` | Completed data or animation. On HTTP 202, poll the export after `Retry-After`. |
+| `POST /nowcasts` · `GET /nowcasts/{id}` | Submit site coordinates, then read the site timeline, best window and three layer run IDs. |
+
+**Retention.** Fields stay active for seven days after last use, then archived originals remain available for another 30 days. Running an archived field reactivates it. Completed run outputs expire after seven days. A run can be repeated until day 37 if its source remains available. Completed nowcasts expire after seven days.
+
+<details>
+<summary><strong>Deployment settings and engine compatibility</strong></summary>
+
+| Environment | Local default | Purpose |
+| --- | --- | --- |
+| `DATA_DIR` | `./data` | Persistent state. Give each API process its own directory. |
+| `ENGINE_BIN` | `climate_sim` on PATH | Native executable used by the worker and capability probes. |
+| `MPIRUN` · `MPIRUN_ARGS` | `mpirun` · empty | Launcher and extra arguments. Compose enables oversubscription. |
+| `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated list of permitted browser origins. |
+| `DISK_SAFETY_MARGIN_BYTES` | `2147483648` | Free space reserved on the data filesystem. |
+| `ENGINE_PERIODIC` | `1` | Advertise wrapping when the engine passes its periodic-boundary probe. |
+
+The Docker build fetches engine `main`. If Sky reports that the engine ignores `wind.mode=file`, a cached build layer may contain an older executable. Set the Docker build argument `ENGINE_REF` to the current engine commit and rebuild the API image. The engine health response includes a binary fingerprint.
+
+[Environment example](.env.example) · [Docker image](Dockerfile) · [OpenAPI schemas](api/openapi.yaml)
+
+</details>
+
+## Project family
+
+[MPI engine](https://github.com/antoniorizzoeng/climate-sim-mpi-cpp) · **Simulation API** (here) · [Browser workspace](https://github.com/antoniorizzoeng/climate-sim-frontend)
+
+## Contributing
+
+Include a minimal request and response for endpoint changes. The test suite covers queue recovery, playback, exports, retention and Sky transport. [Contributing guide](CONTRIBUTING.md)
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE)

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 293" font-family="DejaVu Sans, sans-serif" role="img">
+<title>Frame response time before and after renderer changes</title>
+<rect width="840" height="293" rx="12" fill="#18191f"/>
+<text x="28" y="39" text-anchor="start" font-size="25" fill="#eeedf1">How long does a frame request take?</text>
+<text x="28" y="68" text-anchor="start" font-size="16" fill="#c4c0ca">4096 × 4096 source  ·  median of nine warm requests  ·  milliseconds</text>
+<text x="625" y="108" text-anchor="end" font-size="16" fill="#c2b1e5">Before</text>
+<text x="774" y="108" text-anchor="end" font-size="16" fill="#ffad86">After</text>
+<text x="28" y="141" text-anchor="start" font-size="17" fill="#eeedf1">Native PNG</text>
+<text x="625" y="141" text-anchor="end" font-size="17" fill="#c2b1e5">1,467.28</text>
+<text x="774" y="141" text-anchor="end" font-size="17" fill="#ffad86">297.86</text>
+<rect x="335" y="132" width="183.41" height="5" rx="2" fill="#c2b1e5"/>
+<rect x="335" y="141" width="37.23" height="5" rx="2" fill="#ffad86"/>
+<text x="28" y="181" text-anchor="start" font-size="17" fill="#eeedf1">PNG with max_side=512</text>
+<text x="625" y="181" text-anchor="end" font-size="17" fill="#c2b1e5">876.87</text>
+<text x="774" y="181" text-anchor="end" font-size="17" fill="#ffad86">449.06</text>
+<rect x="335" y="172" width="109.61" height="5" rx="2" fill="#c2b1e5"/>
+<rect x="335" y="181" width="56.13" height="5" rx="2" fill="#ffad86"/>
+<text x="28" y="221" text-anchor="start" font-size="17" fill="#eeedf1">Native float32 values</text>
+<text x="625" y="221" text-anchor="end" font-size="17" fill="#c2b1e5">153.61</text>
+<text x="774" y="221" text-anchor="end" font-size="17" fill="#ffad86">157.50</text>
+<rect x="335" y="212" width="19.20" height="5" rx="2" fill="#c2b1e5"/>
+<rect x="335" y="221" width="19.69" height="5" rx="2" fill="#ffad86"/>
+<text x="28" y="261" text-anchor="start" font-size="17" fill="#eeedf1">Float32 values, window and stride</text>
+<text x="625" y="261" text-anchor="end" font-size="17" fill="#c2b1e5">63.46</text>
+<text x="774" y="261" text-anchor="end" font-size="17" fill="#ffad86">7.14</text>
+<rect x="335" y="252" width="7.93" height="5" rx="2" fill="#c2b1e5"/>
+<rect x="335" y="261" width="0.89" height="5" rx="2" fill="#ffad86"/>
+</svg>
