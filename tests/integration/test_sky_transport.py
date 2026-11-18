@@ -98,3 +98,46 @@ def test_retention_preserves_queued_wind_on_restart(
         result = poll(client, url, lambda r: r.json()["status"] in ("error", "done"))
         assert result.json()["status"] == "done", result.json()["message"]
         assert len(list((engine_settings.data / "fields").glob("*/wind.nc"))) == 3
+
+
+@pytest.mark.integration
+def test_tonight_through_dawn_with_storage(live, monkeypatch):
+    from tests.unit.test_catalog import disk_bytes
+
+    m = live.app.state.manager
+
+    async def synthetic(params, start, fresh):
+        assert params.hours > 1
+        return eastward_bank(params)
+
+    monkeypatch.setattr(m.nowcasts.forecast, "fetch", synthetic)
+    accepted = live.post(
+        "/nowcasts",
+        json=dict(
+            lat=45, lon=10, window="tonight", radius_km=50, resolution=16, hours=1
+        ),
+    )
+    record = poll(
+        live,
+        "/nowcasts/" + accepted.json()["id"],
+        lambda r: r.json()["status"] in ("done", "error"),
+    ).json()
+    assert record["status"] == "done", record["message"]
+    start = datetime.fromisoformat(record["data_time"])
+    dawn = datetime.fromisoformat(record["night"]["dawn"])
+    assert record["params"]["hours"] == 1
+    assert 3600 < (dawn - start).total_seconds() <= 86400
+    assert datetime.fromisoformat(record["site"][-1]["time"]) == dawn
+    for entry in record["layers"]:
+        run = live.get("/runs/" + entry["run_id"]).json()
+        assert run["time"] == pytest.approx((dawn - start).total_seconds())
+    assert live.get("/runs").json()["total"] == 0
+    storage = live.get("/storage").json()
+    assert storage["runs_bytes"] == 0
+    assert storage["nowcasts_bytes"] == disk_bytes(m.runs.root) + disk_bytes(
+        m.nowcasts.records.root
+    )
+    assert storage["fields_bytes"] == disk_bytes(m.fields.root)
+    assert storage["used_bytes"] == storage["nowcasts_bytes"] + storage["fields_bytes"]
+    assert live.delete("/nowcasts/" + record["id"]).status_code == 204
+    assert live.get("/storage").json()["used_bytes"] == 0

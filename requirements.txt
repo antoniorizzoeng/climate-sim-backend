@@ -9,3 +9,4 @@ matplotlib>=3.9,<4
 Pillow>=11,<13
 psutil>=6,<8
 httpx>=0.27,<1
+astronomy-engine==2.1.19

@@ -28,6 +28,19 @@ class Collection:
     def __init__(self, root: Path):
         self.root = root
         self.records = {}
+        self.sizes = {}
+
+    def measure(self, identifier):
+        # Each record owns a flat directory. An encoder can rename a partial
+        # file or the engine can replace progress.json while we sample it.
+        size = 0
+        with os.scandir(self.root / identifier) as files:
+            for entry in files:
+                try:
+                    size += entry.stat().st_size
+                except FileNotFoundError:
+                    continue
+        self.sizes[identifier] = size
 
     def load(self):
         self.root.mkdir(exist_ok=True)
@@ -38,6 +51,7 @@ class Collection:
                 self.records[path.name] = json.loads(
                     (path / "metadata.json").read_text()
                 )
+                self.measure(path.name)
 
     @contextmanager
     def staging(self, identifier=None):
@@ -55,11 +69,13 @@ class Collection:
         directory.rename(self.root / record["id"])
         sync_dir(self.root)
         self.records[record["id"]] = record
+        self.measure(record["id"])
 
     def update(self, record, **changes):
         updated = dict(record, **changes)
         save(self.root / record["id"], updated)
         record.update(changes)
+        self.measure(record["id"])
 
     def remove(self, identifier):
         directory = self.root / identifier
@@ -67,4 +83,5 @@ class Collection:
         directory.rename(trash)
         sync_dir(self.root)
         del self.records[identifier]
+        del self.sizes[identifier]
         shutil.rmtree(trash)

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from math import prod
 from mmap import ACCESS_READ, mmap
 from operator import getitem
+from struct import pack
 from threading import Lock
 
 import netCDF4
@@ -118,10 +119,95 @@ def vertical_metadata(variable):
     return dict(nz=1)
 
 
+def axis_spacing(variable, dim, axis):
+    coord = coordinate(variable.group(), dim)
+    if coord is None or len(dim) < 2 or np.dtype(coord.dtype).kind not in "iuf":
+        return None
+    unit = str(getattr(coord, "units", "")).casefold().replace("_", "").replace(" ", "")
+    lengths = {
+        "m",
+        "meter",
+        "meters",
+        "metre",
+        "metres",
+        "km",
+        "kilometer",
+        "kilometers",
+        "kilometre",
+        "kilometres",
+    }
+    direction = {"x": ("e", "east"), "y": ("n", "north"), "z": ()}[axis]
+    angular = unit in {deg + d for deg in ("degree", "degrees") for d in direction}
+    if not angular and unit not in lengths:
+        return None
+    # Chunk long coordinate axes; include the preceding cell at each boundary.
+    total = coord_sum = 0.0
+    smallest, largest = float("inf"), -float("inf")
+    chunk = CHUNK_BYTES // 8
+    for start in range(0, len(dim) - 1, chunk):
+        values = unpack(coord, slice(start, start + chunk + 1))
+        if not np.isfinite(values).all():
+            return None
+        if angular and axis == "y" and np.max(np.abs(values)) > 90:
+            return None
+        if angular and axis == "y":
+            coord_sum += np.sum(values[:-1])
+        diff = np.diff(values)
+        if angular and axis == "x":
+            diff = (diff + 180) % 360 - 180
+        smallest = min(smallest, diff.min())
+        largest = max(largest, diff.max())
+        total += np.sum(diff)
+    if smallest <= 0 <= largest:
+        return None
+    step = total / (len(dim) - 1)
+    if not np.isfinite(step) or not step:
+        return None
+    approximate = (
+        max(abs(smallest - step), abs(largest - step)) / abs(step) > 0.01 + 1e-12
+    )
+    kind = "degree" if angular else ("km" if unit.startswith("k") else "m")
+    return abs(step), kind, approximate, (coord_sum + values[-1]) / len(dim)
+
+
+def spatial_metadata(variable):
+    meta = vertical_metadata(variable)
+    dims = variable.get_dims()
+    x = axis_spacing(variable, dims[-1], "x")
+    y = axis_spacing(variable, dims[-2], "y")
+    spacing = None
+    if x and y and (x[1] != "degree" or y[1] == "degree"):
+        unit = "km" if "degree" in (x[1], y[1]) or x[1] == "km" else "m"
+
+        def length(axis):
+            if axis[1] == "degree":
+                return axis[0] * np.pi * 6371 / 180
+            if axis[1] == unit:
+                return axis[0]
+            return axis[0] * (1000 if unit == "m" else 0.001)
+
+        z = axis_spacing(variable, dims[-3], "z") if "z_dim" in meta else None
+        dx = length(x)
+        if x[1] == "degree":
+            dx *= np.cos(np.deg2rad(y[3]))
+        dy = length(y)
+        dz = length(z) if z else None
+        if not all(np.isfinite(v) and v > 0 for v in (dx, dy)):
+            return dict(**meta, spacing=None)
+        spacing = dict(
+            dx=dx,
+            dy=dy,
+            dz=dz if dz and np.isfinite(dz) else None,
+            length_unit=unit,
+            approximate=bool("degree" in (x[1], y[1]) or x[2] or y[2] or (z and z[2])),
+        )
+    return dict(**meta, spacing=spacing)
+
+
 def upgrade_field(path, field):
     with dataset(path) as ds:
         for var in field["variables"]:
-            var.update(vertical_metadata(ds[var["name"]]))
+            var.update(spatial_metadata(ds[var["name"]]))
 
 
 def variables(group, prefix=""):
@@ -136,7 +222,7 @@ def variables(group, prefix=""):
             name=prefix + name,
             nx=var.shape[-1],
             ny=var.shape[-2],
-            **vertical_metadata(var),
+            **spatial_metadata(var),
             extra_dims=[extra_dim(group, d) for d in var.get_dims()[:-2]],
             **{
                 attr: value
@@ -414,6 +500,88 @@ def write_drawing(path, raw, shape):
     ) as mapped:
         values = np.ndarray(shape, dtype="<f4", buffer=mapped)
         write_plane(path, values, drawn=True)
+
+
+def seal_frame_array(path, shape):
+    """Freeze the engine's sole CDF-5 record variable before adding coordinates.
+
+    A record variable is interleaved with every other unlimited-time variable.
+    Once MPI has exited, its contiguous doubles are also a valid fixed array.
+    Verify the exact CDF-5 descriptors before changing the three header lengths.
+    Other layouts are handled by libnetcdf. See the Unidata CDF-5 grammar:
+    https://docs.unidata.ucar.edu/nug/2.0-draft/nc3_file_formats.html
+    """
+    frames, *spatial = shape
+    frame_bytes = 8 * prod(spatial)
+    offset = path.stat().st_size - frames * frame_bytes
+    if offset < 44:
+        return
+    ndim = len(shape)
+    # magic, numrecs, NC_DIMENSION, dimension count, first dimension "time".
+    prefix = pack(">4sQIQQ4sQ", b"CDF\x05", frames, 10, ndim, 4, b"time", 0)
+    # NC_VARIABLE, one variable named "u", dimensions in file order,
+    # no attributes, NC_DOUBLE, per-record size, first frame offset.
+    descriptor = (
+        pack(">IQQ4sQ", 11, 1, 1, b"u", ndim)
+        + pack(f">{ndim}Q", *range(ndim))
+        + pack(">IQIQQ", 0, 0, 6, frame_bytes, offset)
+    )
+    with path.open("r+b") as stream:
+        if stream.read(len(prefix)) != prefix:
+            return
+        stream.seek(0)
+        # Actual engine descriptors are within the first few KiB, independent
+        # of any larger MPI alignment. Never read a frame to identify them.
+        header = bytearray(stream.read(min(offset, 65536)))
+        index = header.rfind(descriptor)
+        if index < 0:
+            return
+        end = index + len(descriptor)
+        header[4:12] = pack(">Q", 0)
+        header[len(prefix) - 8 : len(prefix)] = pack(">Q", frames)
+        header[end - 16 : end - 8] = pack(">Q", frames * frame_bytes)
+        stream.seek(0)
+        stream.write(header[:end])
+
+
+def annotate_result(path, run, source_units):
+    """Edit the completed CDF in place. Only coordinate arrays are assigned."""
+    request, resolved = run["request"], run["resolved"]
+    units = request["units"]
+    with dataset(path) as ds:
+        frame_shape = (
+            ds["u"].shape
+            if (
+                ds.data_model == "NETCDF3_64BIT_DATA"
+                and list(ds.variables) == ["u"]
+                and ds["u"].dimensions[0] == "time"
+                and ds.dimensions["time"].isunlimited()
+                and ds["u"].dtype == np.float64
+            )
+            else None
+        )
+    if frame_shape:
+        with _nc_lock:
+            seal_frame_array(path, frame_shape)
+    with dataset(path, "r+") as ds:
+        ds["u"].units = source_units
+        for axis in ds["u"].dimensions:
+            unit = units["time" if axis == "time" else "length"]
+            coord = ds.variables.get(axis)
+            if coord is None:
+                coord = ds.createVariable(axis, "f8", (axis,), fill_value=False)
+            coord.units = "1" if unit in ("cell", "t") else unit
+            for start in range(0, len(coord), CHUNK_BYTES // 8):
+                end = min(start + CHUNK_BYTES // 8, len(coord))
+                indices = np.arange(start, end, dtype="f8")
+                if axis == "time":
+                    values = (
+                        np.minimum(indices * resolved["out_every"], resolved["steps"])
+                        * resolved["dt"]
+                    )
+                else:
+                    values = indices * request.get("d" + axis, 1)
+                coord[start:end] = values
 
 
 def frame_count(path):

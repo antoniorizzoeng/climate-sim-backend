@@ -1,6 +1,7 @@
 """Durable nowcast ownership, forecast acquisition and ordinary FIFO layer runs."""
 
 import asyncio
+import math
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -10,8 +11,8 @@ from uuid import uuid4
 import numpy as np
 import yaml
 
-from . import netcdf, sky
-from .models import DEFAULT_BLEND_TAU_HOURS, NowcastParams
+from . import astronomy, netcdf, sky
+from .models import DEFAULT_BLEND_TAU_HOURS, NowcastParams, invalid
 from .open_meteo import ForecastClient
 from .storage import Collection
 
@@ -87,6 +88,14 @@ class Nowcasts:
         self.forecast.start()
         self.probe_message = await asyncio.to_thread(probe_wind, self.manager.settings)
         for record in list(self.records.records.values()):
+            for entry in record.get("_planned", record["layers"]):
+                run = self.manager.runs.records.get(entry["run_id"])
+                if run and not run.get("_layer"):
+                    self.manager.runs.update(run, _layer=True)
+            if "night" not in record:
+                self.records.update(
+                    record, night=None, params={"window": "now", **record["params"]}
+                )
             if record.get("_deleting"):
                 await self.delete(record)
                 continue
@@ -132,8 +141,23 @@ class Nowcasts:
     def view(record):
         return {k: v for k, v in record.items() if not k.startswith("_")}
 
-    def create(self, params, fresh=False):
+    async def create(self, params, fresh=False):
         now = self.manager.clock()
+        start = now.replace(minute=0, second=0, microsecond=0)
+        tonight = params.window == "tonight"
+        night = await asyncio.to_thread(
+            astronomy.night_at,
+            start,
+            params.lat,
+            params.lon,
+            24 if tonight else params.hours,
+        )
+        seconds = params.hours * 3600
+        if tonight:
+            if night is None:
+                raise invalid("window", "No astronomical darkness in the next 24 hours")
+            dawn = datetime.fromisoformat(night["dawn"])
+            seconds = min(86400, int((dawn - start).total_seconds()))
         with self.records.staging() as (identifier, directory):
             record = dict(
                 id=identifier,
@@ -141,6 +165,8 @@ class Nowcasts:
                 created_at=now.isoformat(),
                 params=params.model_dump(),
                 data_time=None,
+                night=night,
+                _horizon_seconds=seconds,
                 layers=[],
                 grid=sky.grid(params),
                 site=None,
@@ -164,7 +190,7 @@ class Nowcasts:
             status="error" if message else "done",
             message=message,
             site=site,
-            best_window=sky.best_window(site or ()),
+            best_window=sky.best_window(site or (), record["night"]),
             expires_at=(self.manager.clock() + self.retention).isoformat(),
         )
 
@@ -172,8 +198,13 @@ class Nowcasts:
         try:
             if record["status"] == "fetching":
                 params = NowcastParams(**record["params"])
-                start = self.manager.clock().replace(minute=0, second=0, microsecond=0)
-                data = await self.forecast.fetch(params, start, fresh)
+                start = datetime.fromisoformat(record["created_at"]).replace(
+                    minute=0, second=0, microsecond=0
+                )
+                forecast = params.model_copy(
+                    update={"hours": math.ceil(record["_horizon_seconds"] / 3600)}
+                )
+                data = await self.forecast.fetch(forecast, start, fresh)
                 async with self.manager.lock:
                     await self.enqueue(record, params, data, start)
             await self.monitor(record)
@@ -203,7 +234,10 @@ class Nowcasts:
                 f"Sky nowcast {name}", plane.astype("<f4"), field
             )
             await asyncio.to_thread(self.store_wind, field, u, v)
-            req, limit = sky.run_request(params, field, u, v)
+            self.manager.fields.measure(field)
+            req, limit = sky.run_request(
+                params, field, u, v, record["_horizon_seconds"]
+            )
             await self.manager.submit_locked(
                 req, identifier=entry["run_id"], wind_limit=limit
             )

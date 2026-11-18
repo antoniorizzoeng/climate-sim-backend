@@ -5,7 +5,7 @@
 [![CI status](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/ci.yml)
 [![CodeQL status](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/codeql.yml/badge.svg)](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/codeql.yml)
 [![License AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-52475e)](LICENSE)
-[![API version 1.3.2](https://img.shields.io/badge/API-1.3.2-9c523c)](api/openapi.yaml)
+[![API version 1.4.0](https://img.shields.io/badge/API-1.4.0-9c523c)](api/openapi.yaml)
 
 <p align="center">
   <img src="docs/assets/braid-projection.gif" width="820" alt="Three gold and violet tracer filaments travel across a periodic volume, seen in maximum projection."/>
@@ -20,7 +20,7 @@ A browser can ask for a single pixel while the solver is still writing the next 
 | Start a run | Read a run |
 | --- | --- |
 | **Inputs** · Upload NetCDF, send a drawn float32 plane, or start from a preset. Select a variable, an indexed plane or a full volume. | **Frames** · Request a PNG, float32 window or 3D volume. Choose an axis for slices and maximum or mean projections. |
-| **Queue** · Validate grid, stability, ranks and free space. One local worker launches MPI jobs in submission order. | **Exports** · Download the original CDF-5 output, or encode an MP4 or GIF with the chosen range, view, colormap and frame rate. |
+| **Queue** · Validate grid, stability, ranks and free space. One local worker launches MPI jobs in submission order. | **Exports** · Download the CDF-5 output with CF units, or encode an MP4 or GIF with the chosen range, view, colormap and frame rate. |
 
 ## Quick start
 
@@ -35,7 +35,7 @@ With the service running, submit a drifting hotspot from a second terminal.
 ```sh
 curl -fsS http://localhost:8000/runs -H 'Content-Type: application/json' -d '{
   "source":{"kind":"preset","preset":"gaussian_hotspot","nx":64,"ny":32},
-  "processes":2,"dt":0.2,"D":0.1,"vx":1,"steps":60,"frames":7
+  "dt":0.2,"D":0.1,"vx":1,"steps":60,"frames":7
 }'
 ```
 
@@ -60,6 +60,12 @@ flowchart TB
 
 One API process holds the data-directory lock. It serves completed frames while a simulation or export continues. On restart, queued jobs resume and interrupted simulations receive an error status. The queue length, active run ID and free space are available in health-response headers.
 
+Omit `processes` to let the server choose one MPI rank per 131,072 cells, with a minimum of one and a ceiling of `cpu_count`. The server reduces the count until the process grid fits. Both validation and submission return the chosen count in `resolved.processes`. An explicit count still uses the original fit checks. The legacy `/config.default_processes` field continues to report the CPU ceiling.
+
+Run requests accept a display `name` and a `units` object. For example, `{"length":"km","time":"h"}` expresses spacing in km, velocity in km/h and diffusion in km²/h. The default is `{"length":"cell","time":"t"}`. The engine uses the supplied numbers directly. The completed NetCDF download includes labelled time and spatial coordinates and the source variable's units on `u`. Grid units and unknown source units use `"1"`.
+
+Uploads report `variables[].spacing` when their one-dimensional coordinates have recognised length or geographic units. Read `length_unit` alongside `dx`, `dy` and optional `dz`. Geographic spacing uses the plane's mean latitude. Geographic conversion and coordinate intervals varying by over 1% set `approximate` to true.
+
 ## Sky nowcast
 
 ![Live Sky workspace showing the blended clear-sky forecast and hourly seeing at Roque de los Muchachos](docs/assets/sky.webp)
@@ -68,7 +74,9 @@ At **Roque de los Muchachos**, the curves begin together and then diverge as the
 
 1. **Transport.** Open-Meteo supplies low, mid and high cloud cover and winds at 850, 500 and 300 hPa. Three MPI runs transport the layers across a local grid with zero-gradient edges. The default grid is 96² over 600 km. Frames are ten minutes apart.
 2. **Blend.** The site timeline combines transported cover with the hourly model forecast. The transport weight is `exp(−t/τ)` for lead time `t`. With the default `τ = 2 h`, transport supplies about 37% after two hours. Layer overlap is treated as random when computing the transported total.
-3. **Observing window.** The longest stretch with at least 70% blended clear sky and good or fair seeing wins. The earliest stretch wins a tie. Seeing comes from 250 hPa wind speed alone, and local turbulence can dominate.
+3. **Observing window.** The longest stretch with at least 70% blended clear sky and good or fair seeing wins. When the forecast overlaps astronomical night, only samples from dusk through dawn qualify. The earliest stretch wins a tie. Seeing comes from 250 hPa wind speed alone, and local turbulence can dominate.
+
+Set `window` to `now` (the default) for the next `hours`, or `tonight` to run from the weather data's valid hour through astronomical dawn, up to 24 hours. The last transport interval can be shorter than ten minutes to land on dawn. Sites with no astronomical darkness in the next 24 hours receive HTTP 422 for `tonight`. The `night` object gives UTC dusk and dawn at solar altitude −18°, plus airless topocentric lunar altitude and illuminated fraction at ten-minute intervals. Historical forecasts without astronomy data return `night: null`.
 
 The solver omits cloud formation, dissipation and vertical motion. Incoming cloud beyond the finite grid is unknown. The only location data in the weather request are the site and surrounding grid coordinates. Open-Meteo also receives the requested variables and UTC hours. Site names, uploaded fields and simulation results stay local. [Open-Meteo forecast variables](https://open-meteo.com/en/docs) · [Saved-forecast evaluation against later model estimates](scripts/nowcast_skill.py)
 
@@ -84,12 +92,18 @@ Nine warm requests per case, one logical CPU on a Ryzen 5 8500G, in-process Fast
 
 | Request | Result |
 | --- | --- |
+| `GET /health` | Worker status, engine fingerprint and the canonical contract's `api_version`. |
+| `GET /storage` | Bytes in user runs, fields (including archives) and nowcasts (including layer runs), plus free and total bytes on the data volume. |
+| `GET /runs` · `GET /fields` | Filter by `q` (name substring or ID prefix), `created_from` (inclusive) and `created_to` (exclusive). Sort by `created`, `size` or `name` with `_asc` or `_desc`. The default is `created_desc`. |
+| `PATCH /runs/{id}` · `PATCH /fields/{id}` | Send `{"name":"Evening baseline"}`. Names are trimmed and must contain 1–120 characters. Field downloads retain the original filename. |
 | `POST /fields` · `POST /fields/drawn` | Stored field ID and metadata for an upload or a bottom-row-first drawing. |
 | `POST /runs/validate` · `POST /runs` | Resolved settings and warnings, or a queued run. Poll `GET /runs/{runId}` for readable frames. |
 | `GET /runs/{runId}/frames/{n}.png` | Zero-based frame. Set `colormap`, `vmin` and `vmax`, and optionally `max_side`. |
 | `GET /runs/{runId}/frames/{n}/values` · `…/volume` | Little-endian float32 plane or volume. Window and stride the plane, or read a 3D grid. |
 | `GET /runs/{runId}/result.nc` · `…/export.gif` · `…/export.mp4` | Completed data or animation. On HTTP 202, poll the export after `Retry-After`. |
 | `POST /nowcasts` · `GET /nowcasts/{id}` | Submit site coordinates, then read the site timeline, best window and three layer run IDs. |
+
+List responses include `total` and `total_bytes` across all matching pages. Reuse the same filters and sort with `next_cursor`. User run lists exclude nowcast layers, which remain accessible by ID. Each active record's `size_bytes` includes the files in its directory. Expired runs report zero output bytes, while `/storage` still counts retained metadata until deletion.
 
 **Retention.** Fields stay active for seven days after last use, then archived originals remain available for another 30 days. Running an archived field reactivates it. Completed run outputs expire after seven days. A run can be repeated until day 37 if its source remains available. Completed nowcasts expire after seven days.
 

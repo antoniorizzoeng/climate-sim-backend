@@ -28,12 +28,16 @@ def create_app(settings=None, clock=utcnow):
         finally:
             await manager.close()
 
-    api = FastAPI(title="climate-sim API", version="1.3.2", lifespan=lifespan)
+    with CONTRACT.open() as stream:
+        spec = yaml.safe_load(stream)
+    api = FastAPI(
+        title="climate-sim API", version=spec["info"]["version"], lifespan=lifespan
+    )
     api.include_router(router)
     api.add_middleware(
         CORSMiddleware,
         allow_origins=[origin for origin in settings.origins if origin != "*"],
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["*"],
         expose_headers=[
             "X-Nx",
@@ -68,8 +72,7 @@ def create_app(settings=None, clock=utcnow):
         return JSONResponse({"detail": "Internal server error"}, status_code=500)
 
     # Serve the canonical schema, including deepObject queries and binary media types.
-    with CONTRACT.open() as stream:
-        api.openapi_schema = yaml.safe_load(stream)
+    api.openapi_schema = spec
     return api
 
 

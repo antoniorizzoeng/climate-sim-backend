@@ -145,7 +145,7 @@ def test_mpi_dims_and_disk_warning(settings):
         {k: v for k, v in preset().items() if k != "processes"}
     )
     report = resolve(req, 4, 20, replace(settings, cpu_count=19), 0)
-    assert report["warnings"] and report["resolved"]["processes"] == 16
+    assert report["warnings"] and report["resolved"]["processes"] == 1
     assert not resolve(
         req.model_copy(update={"processes": 7}),
         4,

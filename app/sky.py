@@ -78,19 +78,23 @@ def layer_inputs(data, layer, n):
     )
 
 
-def run_request(params, field_id, u, v):
+def run_request(params, field_id, u, v, seconds=None):
     dx = grid(params)["dx_m"]
     limit = stability_limit(
         dx, dx, DIFFUSION, float(np.abs(u).max()), float(np.abs(v).max())
     )
-    every = max(1, math.ceil(FRAME_SECONDS / (0.9 * limit)))
+    seconds = seconds or params.hours * 3600
+    interval = math.gcd(seconds, FRAME_SECONDS)
+    subdivisions = max(1, math.ceil(interval / (0.9 * limit)))
+    every = (FRAME_SECONDS // interval) * subdivisions
     req = RunRequest(
         source={"kind": "field", "field_id": field_id},
         dx=dx,
         dy=dx,
         D=DIFFUSION,
         dt=FRAME_SECONDS / every,
-        steps=params.hours * 6 * every,
+        steps=(seconds // interval) * subdivisions,
+        units={"length": "m", "time": "s"},
         out_every=every,
         bc=dict.fromkeys(("left", "right", "bottom", "top"), "neumann"),
     )
@@ -151,7 +155,20 @@ def blend_site(rows, tau_hours):
     return blended
 
 
-def best_window(rows):
+def best_window(rows, night=None):
+    if night and rows:
+        dusk, dawn = (datetime.fromisoformat(night[key]) for key in ("dusk", "dawn"))
+        start = datetime.fromisoformat(rows[0]["time"])
+
+        def in_night(row):
+            time = datetime.fromisoformat(row["time"])
+            return (
+                dusk <= time <= dawn
+                and (time - start).total_seconds() % FRAME_SECONDS == 0
+            )
+
+        rows = filter(in_night, rows)
+
     def qualifies(row):
         return row["blend"]["clear"] >= 0.70 and row["seeing"] != "poor"
 
@@ -174,18 +191,20 @@ def timeline(record, runs_dir):
         for entry in record["layers"]
     }
     start = datetime.fromisoformat(record["data_time"])
-    hours = range(record["params"]["hours"] + 1)
+    seconds = record.get("_horizon_seconds", record["params"]["hours"] * 3600)
+    hours = range(math.ceil(seconds / 3600) + 1)
     rows = []
-    for i in range(6 * (len(hours) - 1) + 1):
+    for i in range(math.ceil(seconds / FRAME_SECONDS) + 1):
+        elapsed = min(i * FRAME_SECONDS, seconds)
         at_site = {k: s[i] for k, s in samples.items()}
         forecast = {
-            k: float(np.interp(i / 6, hours, model[k]))
+            k: float(np.interp(elapsed / 3600, hours, model[k]))
             for k in ("low", "mid", "high", "total")
         }
-        jet = model["jet_ms"][i // 6]
+        jet = model["jet_ms"][elapsed // 3600]
         rows.append(
             dict(
-                time=(start + timedelta(seconds=i * FRAME_SECONDS)).isoformat(),
+                time=(start + timedelta(seconds=elapsed)).isoformat(),
                 nowcast=cover(**at_site),
                 model=cover(**forecast),
                 jet_ms=jet,

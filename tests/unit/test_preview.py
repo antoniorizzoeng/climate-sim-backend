@@ -91,6 +91,8 @@ def test_projected_frame_and_native_memory_errors(settings, clock, monkeypatch):
     directory.mkdir(parents=True)
     metadata = dict(
         id="finished",
+        request={"source": {"kind": "preset", "preset": "constant_zero"}},
+        created_at=clock().isoformat(),
         _order=1,
         status="done",
         finished_at=clock().isoformat(),

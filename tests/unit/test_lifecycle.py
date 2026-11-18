@@ -27,7 +27,11 @@ def test_contract(client):
 
     spec = yaml.safe_load(CONTRACT.read_text())
     validate(spec)
-    assert spec["info"]["version"] == "1.3.2"
+    assert (
+        spec["info"]["version"]
+        == client.get("/health").json()["api_version"]
+        == "1.4.0"
+    )
     expected = {
         (p, method.upper()): set(map(int, op["responses"]))
         for p, path in spec["paths"].items()
@@ -49,12 +53,19 @@ def test_contract(client):
     request = preset(dz=2, Dz=0.5, vz=1, bc={"front": "neumann", "back": "neumann"})
     request["source"]["nz"] = 4
     created = client.post("/runs", json=request)
+    field = draw(client).json()
+    rename = {"name": "Baseline"}
     for schema, data in [
+        ("RenameRequest", rename),
+        ("Units", created.json()["request"]["units"]),
+        ("StorageUsage", client.get("/storage").json()),
         ("ServerConfig", client.get("/config").json()),
         ("Run", created.json()),
         ("Nowcast", client.post("/nowcasts", json={"lat": 45, "lon": 10}).json()),
         ("Run", wait_run(client, created.json()["id"], "error")),
-        ("Field", draw(client).json()),
+        ("Field", field),
+        ("Field", client.patch("/fields/" + field["id"], json=rename).json()),
+        ("Run", client.patch("/runs/" + created.json()["id"], json=rename).json()),
         ("RunValidation", client.post("/runs/validate", json=request).json()),
         ("ValidationError", client.post("/runs", json={}).json()),
         ("MessageError", client.get("/fields/missing").json()),
@@ -62,6 +73,13 @@ def test_contract(client):
         Draft202012Validator(
             {"components": spec["components"], "$ref": f"#/components/schemas/{schema}"}
         ).validate(data)
+    for path in ("/runs", "/fields", "/health"):
+        schema = spec["paths"][path]["get"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"]
+        Draft202012Validator({"components": spec["components"], **schema}).validate(
+            client.get(path).json()
+        )
     assert client.get("/health").json()["status"] == "ok"
     assert (
         "periodic" not in client.get("/config").json()["supported_boundary_conditions"]
@@ -96,7 +114,9 @@ def test_retention_boundaries_and_reactivation(settings, clock):
         for path in ["/preview.png", "/stats", "/values"]:
             assert c.get(f + path).status_code == 409
         expired = c.get(url).json()
-        assert expired["status"] == "expired" and expired["request"] == req
+        assert expired["status"] == "expired" and expired["request"] == req | {
+            "units": {"length": "cell", "time": "t"}
+        }
         assert expired["expires_at"] == c.get(f).json()["expires_at"]
         assert {p.name for p in run_dir.iterdir()} == {"metadata.json"}
         for path in ["/result.nc", "/export.mp4", "/frames/0.png"]:

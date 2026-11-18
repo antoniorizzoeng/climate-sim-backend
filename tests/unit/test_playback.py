@@ -60,7 +60,13 @@ def test_progress_is_authoritative_and_export_survives_restart(
             c.get(url + "/frames/1/values").content
             == np.arange(35, 70, dtype="<f4").tobytes()
         )
-        assert c.get(url + "/result.nc").content == fixture.read_bytes()
+        download = tmp_path / "download.nc"
+        download.write_bytes(c.get(url + "/result.nc").content)
+        with netCDF4.Dataset(download) as annotated, netCDF4.Dataset(
+            fixture
+        ) as original:
+            np.testing.assert_array_equal(annotated["u"][:], original["u"][:])
+            assert all(annotated[v].units == "1" for v in ("time", "y", "x", "u"))
         contents = {}
         for fmt in ("gif", "mp4"):
             ep = url + "/export." + fmt
