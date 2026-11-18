@@ -108,7 +108,7 @@ def test_legacy_records(settings, clock):
         for kind, record in (("fields", field), ("runs", run)):
             item = c.get(f"/{kind}/{record['id']}").json()
             assert item["size_bytes"] == disk_bytes(settings.data / kind / record["id"])
-        assert item["name"] == "Temperature · 01 Jan 00:00"
+        assert item["name"] == "Temperature · 01 Jan 00:00 UTC"
         assert item["request"]["units"] == {"length": "cell", "time": "t"}
         old = c.get("/nowcasts/" + sky["id"]).json()
         assert old["night"] is None and old["params"]["window"] == "now"
