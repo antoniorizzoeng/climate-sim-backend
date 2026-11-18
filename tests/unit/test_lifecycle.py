@@ -27,7 +27,7 @@ def test_contract(client):
 
     spec = yaml.safe_load(CONTRACT.read_text())
     validate(spec)
-    assert spec["info"]["version"] == "1.3.1"
+    assert spec["info"]["version"] == "1.3.2"
     expected = {
         (p, method.upper()): set(map(int, op["responses"]))
         for p, path in spec["paths"].items()

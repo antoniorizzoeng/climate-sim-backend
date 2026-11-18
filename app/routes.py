@@ -17,9 +17,12 @@ from starlette.concurrency import run_in_threadpool
 
 from . import netcdf
 from .disk import CHUNK_BYTES, DiskSpaceError
+from .image_memory import ImageTooLarge
 from .manager import lookup
 from .models import Colormap, NowcastParams, Preset, RunRequest, invalid
-from .render import Style, png
+from .render import Style
+from .render import field_preview_png as render_field_preview
+from .render import frame_png as render_frame_png
 from .uploads import read_form
 
 router = APIRouter()
@@ -236,17 +239,32 @@ async def original(fieldId: str, m=M):
         return Download(m.field_path(item), name, "application/x-netcdf")
 
 
-async def field_data(m, field_id, var, index, *, window=None, stats=False):
+async def field_data(
+    m, field_id, var, index, *, window=None, stats=False, options=None
+):
     async with m.lock:
         item = lookup(m.fields, field_id)
         if item["state"] == "archived":
             raise HTTPException(409, "Field is archived")
         try:
+            if options is not None:
+                return await asyncio.to_thread(
+                    render_field_preview,
+                    m.field_path(item),
+                    item,
+                    var,
+                    index,
+                    m.disk,
+                    options,
+                    m.settings,
+                )
             if stats:
                 return await asyncio.to_thread(
                     netcdf.field_stats, m.field_path(item), item, var, index, m.disk
                 )
             return await asyncio.to_thread(m.field_plane, item, var, index, window)
+        except ImageTooLarge as exc:
+            raise HTTPException(413, str(exc)) from exc
         except DiskSpaceError as exc:
             raise invalid("var", str(exc), "query") from exc
         except HTTPException as exc:
@@ -263,7 +281,9 @@ async def field_stats(
         return await field_data(m, fieldId, var, index, stats=True)
 
 
-@router.get("/fields/{fieldId}/preview.png", responses={404: {}, 409: {}, 422: {}})
+@router.get(
+    "/fields/{fieldId}/preview.png", responses={404: {}, 409: {}, 413: {}, 422: {}}
+)
 async def field_preview(
     fieldId: str,
     var: str | None = None,
@@ -271,13 +291,9 @@ async def field_preview(
     options=Depends(style),
     m=M,
 ):
-    def preview(plane):
-        summary = netcdf.stats(plane, var, {})
-        return png(plane, options, (summary["min"], summary["max"]))
-
     async with m.read_slots:
-        plane, _ = await field_data(m, fieldId, var, index)
-        return Response(await asyncio.to_thread(preview, plane), media_type="image/png")
+        content = await field_data(m, fieldId, var, index, options=options)
+        return Response(content, media_type="image/png")
 
 
 @router.get("/fields/{fieldId}/values", responses={404: {}, 409: {}, 422: {}})
@@ -337,7 +353,7 @@ async def rerun(runId: str, m=M):
     )
 
 
-async def frame(m, run_id, n, reader, *selection):
+async def frame(m, run_id, n, reader, *selection, display=False):
     async with m.lock:
         run = lookup(m.runs, run_id)
         if run["status"] == "expired" or n >= run["resolved"]["expected_frames"]:
@@ -347,27 +363,28 @@ async def frame(m, run_id, n, reader, *selection):
             await m.refresh(run)
         if n >= run["frames"]:
             raise HTTPException(409, "Frame has not been written")
+        path = m.runs.root / run_id / "result.nc"
+        if display:
+            selection += (run["display_range"],)
         try:
-            plane = await asyncio.to_thread(
-                reader, m.runs.root / run_id / "result.nc", n, *selection
-            )
+            return await asyncio.to_thread(reader, path, n, *selection)
+        except ImageTooLarge as exc:
+            raise HTTPException(413, str(exc)) from exc
         except (OSError, RuntimeError, ValueError, IndexError) as exc:
             if running:
                 raise HTTPException(409, "Frame is not yet readable") from exc
             raise
-        return plane, run["display_range"]
 
 
-@router.get("/runs/{runId}/frames/{n}.png", responses={404: {}, 409: {}, 422: {}})
+@router.get(
+    "/runs/{runId}/frames/{n}.png", responses={404: {}, 409: {}, 413: {}, 422: {}}
+)
 async def frame_png(
     runId: str, n: RunIndex, options=Depends(style), view=Depends(frame_view), m=M
 ):
     async with m.read_slots:
-        (plane, whole_field), limits = await frame(
-            m, runId, n, netcdf.read_image_plane, view, options.vmin is None
-        )
-        content = await asyncio.to_thread(
-            png, plane, options, limits, indexed=True, whole_field=whole_field
+        content = await frame(
+            m, runId, n, render_frame_png, view, options, m.settings, display=True
         )
         return Response(
             content,
@@ -381,7 +398,7 @@ async def frame_values(
     runId: str, n: RunIndex, win=Depends(window), view=Depends(frame_view), m=M
 ):
     async with m.read_slots:
-        plane, _ = await frame(m, runId, n, netcdf.read_frame, win, view)
+        plane = await frame(m, runId, n, netcdf.read_frame, win, view)
         return await asyncio.to_thread(values_response, plane, win)
 
 
@@ -390,7 +407,7 @@ async def frame_volume(
     runId: str, n: RunIndex, max_side: Annotated[int, Query(ge=1, le=128)] = 64, m=M
 ):
     async with m.read_slots:
-        volume, _ = await frame(m, runId, n, netcdf.read_volume, max_side)
+        volume = await frame(m, runId, n, netcdf.read_volume, max_side)
         nz, ny, nx = volume.shape
         return Response(
             memoryview(volume).cast("B"),

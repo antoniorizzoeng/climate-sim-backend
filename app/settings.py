@@ -17,6 +17,8 @@ class Settings:
     periodic: bool
     cpu_count: int
     disk_margin_bytes: int = 2 * 1024**3
+    preview_memory_bytes: int = 256 * 1024**2
+    native_image_ram_fraction: float = 0.25
 
     @classmethod
     def from_env(cls):
@@ -33,6 +35,12 @@ class Settings:
         disk_margin = int(os.getenv("DISK_SAFETY_MARGIN_BYTES", str(2 * 1024**3)))
         if disk_margin < 0:
             raise ValueError("DISK_SAFETY_MARGIN_BYTES must be nonnegative")
+        preview_memory = int(os.getenv("PREVIEW_MEMORY_BYTES", str(256 * 1024**2)))
+        if preview_memory <= 0:
+            raise ValueError("PREVIEW_MEMORY_BYTES must be positive")
+        native_fraction = float(os.getenv("NATIVE_IMAGE_RAM_FRACTION", "0.25"))
+        if not 0 < native_fraction <= 1:
+            raise ValueError("NATIVE_IMAGE_RAM_FRACTION must be in (0, 1]")
         return cls(
             Path(os.getenv("DATA_DIR", "data")).expanduser().resolve(),
             str(Path(executable).resolve()) if executable else engine,
@@ -46,6 +54,8 @@ class Settings:
             os.getenv("ENGINE_PERIODIC", "1") == "1",
             cpu_count or 1,
             disk_margin,
+            preview_memory,
+            native_fraction,
         )
 
     def engine_description(self):
