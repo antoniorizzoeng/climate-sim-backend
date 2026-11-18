@@ -114,7 +114,11 @@ def stability_limit(dx, dy, diffusion, vx, vy):
     return min(float(inverse_rate(*map(Decimal, args))), sys.float_info.max)
 
 
-def resolve(req, nx, ny, settings, free_bytes):
+def initial_bytes(req, nx, ny):
+    return 4096 + 8 * nx * ny if isinstance(req.source, FieldSource) else 0
+
+
+def resolve(req, nx, ny, settings, available_bytes):
     errors = []
     if req.frames is not None and req.out_every is not None:
         errors.append(issue("frames", "frames and out_every are mutually exclusive"))
@@ -163,7 +167,12 @@ def resolve(req, nx, ny, settings, free_bytes):
         estimated_output_bytes=size,
     )
     warnings = (
-        ["Estimated output exceeds available disk space"] if size > free_bytes else []
+        [
+            "Estimated output and staged input exceed available disk space "
+            f"above the {settings.disk_margin_bytes}-byte safety margin"
+        ]
+        if size + initial_bytes(req, nx, ny) > available_bytes
+        else []
     )
     if every > ENGINE_INT_MAX:
         warnings.append(

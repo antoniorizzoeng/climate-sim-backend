@@ -9,4 +9,4 @@ test:
 up:
 	docker compose up --build
 api:
-	uvicorn app.main:app
+	uvicorn app.main:app --no-access-log

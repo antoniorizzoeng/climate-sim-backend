@@ -39,6 +39,7 @@ def settings(tmp_path):
         engine="/engine-unavailable",
         mpirun="missing-mpirun",
         periodic=False,
+        origins=("http://localhost:3000", "http://localhost:5173"),
     )
 
 

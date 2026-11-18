@@ -6,6 +6,7 @@ services:
     environment:
       DATA_DIR: /data
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      DISK_SAFETY_MARGIN_BYTES: ${DISK_SAFETY_MARGIN_BYTES:-2147483648}
       ENGINE_PERIODIC: ${ENGINE_PERIODIC:-0}
       MPIRUN_ARGS: ${MPIRUN_ARGS:---oversubscribe}
     volumes:

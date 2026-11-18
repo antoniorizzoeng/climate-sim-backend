@@ -7,8 +7,8 @@ on:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -23,8 +23,13 @@ jobs:
           persist-credentials: false
       - name: Build the MPI engine
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg openmpi-bin libopenmpi-dev libyaml-cpp-dev libnetcdf-dev libpnetcdf-dev
+          APT="sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
+          $APT update
+          $APT install -y --no-install-recommends openmpi-bin libopenmpi-dev libyaml-cpp-dev libnetcdf-dev libpnetcdf-dev
+          # Static ffmpeg from the imageio-ffmpeg wheel (apt's ffmpeg pulls a huge dependency tree).
+          python -m pip install imageio-ffmpeg
+          sudo ln -sf "$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" /usr/local/bin/ffmpeg
+          ffmpeg -version | head -1
           cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
           cmake --build engine/build --target climate_sim --parallel 2
           test -x engine/build/src/climate_sim

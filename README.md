@@ -12,7 +12,7 @@ source .venv/bin/activate
 pip install -r requirements-dev.txt
 export ENGINE_BIN="$HOME/climate-sim/climate-sim-mpi-cpp/build/src/climate_sim"
 export MPIRUN_ARGS=--oversubscribe
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
 Use one API process per data directory. The manager enforces exclusive ownership, runs jobs in submission order and serves independent requests during MPI execution and encoding. On restart it resumes queued jobs and marks interrupted simulations as errors.
@@ -34,7 +34,12 @@ Open http://localhost:8000/docs. The image builds the simulator from the engine 
 | MPIRUN | mpirun | Local MPI launcher. |
 | MPIRUN_ARGS | empty | Additional shell-quoted launcher arguments, e.g. --oversubscribe. Compose defaults to --oversubscribe. |
 | CORS_ORIGINS | http://localhost:3000 | Comma-separated browser origins. |
+| DISK_SAFETY_MARGIN_BYTES | 2147483648 (2 GiB) | Free space to keep on the data filesystem. |
 | ENGINE_PERIODIC | 0 | Set to 1 when the installed engine supports periodic boundary conditions. |
+
+The service logs one JSON line per request and simulation state change. `GET /health` reports `X-Queue-Length`, `X-Active-Run-Id` (empty when idle), and `X-Disk-Free-Bytes` in response headers.
+
+Uploads are streamed into the data directory. The service checks declared NetCDF-4 sizes before decoding and rejects writes that would consume the disk reserve. `POST /runs/validate` reports space estimates in `warnings`. The run is checked again at submission and when the engine starts, since available space can change while it is queued.
 
 ## Run and retrieve a simulation
 
@@ -57,6 +62,8 @@ pytest -q
 ```
 
 For the opt-in live data check, run `RUN_NETWORK_TESTS=1 pytest -m network --no-cov`. Test dependencies include pytest-cov. CI enforces 90% branch-inclusive coverage and builds the engine from main for the integration tests. The local suite looks for ENGINE_BIN or the development build shown above. It reports a skip reason if the executable is missing.
+
+See [the rendering benchmark](docs/performance.md) for timings and reproduction steps.
 
 ## Sky nowcast
 
