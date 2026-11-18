@@ -1,5 +1,7 @@
 import io
 import json
+import re
+import shutil
 import subprocess
 
 import netCDF4
@@ -75,10 +77,7 @@ def test_upload_run_frames_result_and_exports(live, tmp_path):
         assert live.get(endpoint).content == ready.content
         path = tmp_path / f"download.{fmt}"
         path.write_bytes(ready.content)
-        probe = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)]
-        )
-        (stream,) = json.loads(probe)["streams"]
+        stream = probe_video(path)
         assert int(stream["nb_frames"]) == run["frames"]
         if fmt == "mp4":
             assert (
@@ -269,3 +268,39 @@ def test_export_coalesces_while_encoder_is_busy_and_recovers(live, monkeypatch):
 
     assert live.get(url).status_code == 202
     assert poll(live, url, lambda r: r.status_code != 202).status_code == 200
+
+
+def probe_video(path):
+    """Stream facts via ffprobe, or via plain ffmpeg when ffprobe is absent (CI)."""
+    if shutil.which("ffprobe"):
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)]
+        )
+        (stream,) = json.loads(out)["streams"]
+        return stream
+    info = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", str(path)], capture_output=True, text=True
+    ).stderr
+    match = re.search(r"Video: (\w+).*?, (\w+)(?:\([^)]*\))?, (\d+)x(\d+)", info)
+    codec, pix_fmt, width, height = match.groups()
+    raw = subprocess.check_output(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ]
+    )
+    return {
+        "codec_name": codec,
+        "pix_fmt": pix_fmt,
+        "width": int(width),
+        "height": int(height),
+        "nb_frames": len(raw) // (int(width) * int(height)),
+    }
