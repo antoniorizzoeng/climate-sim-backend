@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app import open_meteo
 from app.models import NowcastParams
 from app.open_meteo import BATCH_SIZE, UNITS, ForecastClient, parse
 
@@ -23,7 +24,8 @@ def recorded():
 def test_recorded_response(recorded):
     times = recorded[0]["hourly"]["time"]
     parsed = parse(recorded, 2, times)
-    assert set(parsed) == set(UNITS)
+    assert set(parsed) == {*UNITS, "elevation"}
+    assert parsed["elevation"] == [40.0, 38.0]
     assert parsed["cloud_cover_mid"][1].tolist() == [0.09, 0.88]
     assert parsed["wind_speed_250hPa"][0].tolist() == [66.87, 67.59]
     assert parse(recorded[0], 1, times)["cloud_cover"][0].tolist() == [0.86, 0.99]
@@ -84,7 +86,11 @@ def test_batches_cache_refresh_and_expiry(tmp_path, clock, recorded, monkeypatch
         api.start()
         return asyncio.run(api.fetch(p, start, fresh))
 
-    assert fetch(False)["cloud_cover_low"].shape == (81, 2)
+    data = fetch(False)
+    assert data["cloud_cover_low"].shape == (81, 2)
+    assert data["site_elevation"] == dict(
+        elevation_m=40, source="open-meteo", layer_weights=dict(low=1, mid=1, high=1)
+    )
     assert calls == [BATCH_SIZE, 17]
     fetch(False)
     assert len(calls) == 2
@@ -121,3 +127,49 @@ def test_quota_and_429(tmp_path, clock, recorded):
                     await api.batch(c, [(0, 0)], recorded[0]["hourly"]["time"], False)
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("override", [None, 0, 4205])
+def test_observer_uses_centre_and_initial_hour(
+    tmp_path, clock, recorded, monkeypatch, override
+):
+    profile = json.loads(
+        (Path(__file__).parents[1] / "fixtures/mauna_kea_profile.json").read_text()
+    )
+    params = NowcastParams(
+        lat=19.8206, lon=-155.4681, radius_km=200, hours=1, elevation_m=override
+    )
+    site = (f"{params.lat:.6f}", f"{params.lon:.6f}")
+    profile_calls = []
+
+    async def get(client, url, params):
+        points = list(
+            zip(params["latitude"].split(","), params["longitude"].split(","))
+        )
+        if params["hourly"].split(",") == list(open_meteo.PROFILE_UNITS):
+            assert params["start_hour"] == params["end_hour"]
+            assert points == [site]
+            profile_calls.append(points)
+            profile["hourly"]["time"] = [params["start_hour"]]
+            return httpx.Response(200, json=profile)
+        rows = []
+        for i, point in enumerate(points):
+            row = copy.deepcopy(recorded[0])
+            row.update(location_id=i, elevation=4196 if point == site else 20)
+            row["hourly"]["time"] = [params["start_hour"], params["end_hour"]]
+            rows.append(row)
+        return httpx.Response(200, json=rows)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", get)
+    api = ForecastClient(tmp_path, clock)
+    api.start()
+    result = asyncio.run(api.fetch(params, clock(), False))["site_elevation"]
+    elevation = 4196 if override is None else override
+    assert result["elevation_m"] == elevation
+    assert result["source"] == ("open-meteo" if override is None else "user")
+    assert len(profile_calls) == int(elevation > 0)
+    # In this profile the middle band is clear, with limits at 3178 and 8576.22 m.
+    mid = min(1, (8576.22 - (elevation - 250)) / (8576.22 - 3178))
+    assert result["layer_weights"] == pytest.approx(
+        dict(low=int(elevation == 0), mid=mid, high=1)
+    )

@@ -5,7 +5,7 @@
 [![CI status](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/ci.yml)
 [![CodeQL status](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/codeql.yml/badge.svg)](https://github.com/antoniorizzoeng/climate-sim-backend/actions/workflows/codeql.yml)
 [![License AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-52475e)](LICENSE)
-[![API version 1.4.0](https://img.shields.io/badge/API-1.4.0-9c523c)](api/openapi.yaml)
+[![API version 1.5.0](https://img.shields.io/badge/API-1.5.0-9c523c)](api/openapi.yaml)
 
 <p align="center">
   <img src="docs/assets/braid-projection.gif" width="820" alt="Three gold and violet tracer filaments travel across a periodic volume, seen in maximum projection."/>
@@ -73,8 +73,14 @@ Uploads report `variables[].spacing` when their one-dimensional coordinates have
 At **Roque de los Muchachos**, the curves begin together and then diverge as the wind carries clouds across the site. The screenshot is a saved six-hour forecast. Its highlighted observing window belongs to that forecast time.
 
 1. **Transport.** Open-Meteo supplies low, mid and high cloud cover and winds at 850, 500 and 300 hPa. Three MPI runs transport the layers across a local grid with zero-gradient edges. The default grid is 96² over 600 km. Frames are ten minutes apart.
-2. **Blend.** The site timeline combines transported cover with the hourly model forecast. The transport weight is `exp(−t/τ)` for lead time `t`. With the default `τ = 2 h`, transport supplies about 37% after two hours. Layer overlap is treated as random when computing the transported total.
+2. **Blend.** The site timeline combines transported cover with the hourly model forecast. The transport weight is `exp(−t/τ)` for lead time `t`. With the default `τ = 2 h`, transport supplies about 37% after two hours. Sky blends the raw layers individually, then computes total cover above the observer.
 3. **Observing window.** The longest stretch with at least 70% blended clear sky and good or fair seeing wins. When the forecast overlaps astronomical night, only samples from dusk through dawn qualify. The earliest stretch wins a tie. Seeing comes from 250 hPa wind speed alone, and local turbulence can dominate.
+
+**Cloud above the observer.** Supply `elevation_m` in metres above sea level or let Sky use the terrain elevation in the site's existing Open-Meteo grid response. Each record exposes the chosen elevation, its source, and low/mid/high weights in `site_elevation`. Open-Meteo describes the layers as low (including fog) up to about 3 km, mid from 3 to 8 km and high above 8 km. The exact layer diagnostics depend on the weather model. Open-Meteo explicitly defines geopotential heights relative to sea level. [Forecast variables and pressure levels](https://open-meteo.com/en/docs) · [ECMWF layer definitions](https://open-meteo.com/en/docs/ecmwf-api)
+
+Sky estimates the layer boundaries using the site's 700 and 350 hPa heights at the initial forecast hour. If a boundary height is missing, Sky interpolates between the available surfaces in log pressure. It integrates from sea level to the local 100 hPa surface. Within each band, a pressure-level cloud fraction represents the slab halfway to the neighbouring samples. A layer's weight is the cloud-weighted slab thickness above `elevation_m − 250 m` divided by its full cloud-weighted thickness. The 250 m allowance includes fog near the observer. If a band has no usable cloud signal, Sky uses the fraction of its geometric thickness above the cutoff. Sites at or below 250 m get three unit weights. Sky keeps the weights for the whole record, so later changes in deck height are a source of uncertainty.
+
+For each time and series, clear fraction is `(1 − low × w_low) × (1 − mid × w_mid) × (1 − high × w_high)`, and total is one minus clear. The model series uses Open-Meteo's own total when all weights equal one. The response also includes the original layer covers. Records from earlier versions return `site_elevation: null` and retain their saved totals and observing windows.
 
 Set `window` to `now` (the default) for the next `hours`, or `tonight` to run from the weather data's valid hour through astronomical dawn, up to 24 hours. The last transport interval can be shorter than ten minutes to land on dawn. Sites with no astronomical darkness in the next 24 hours receive HTTP 422 for `tonight`. The `night` object gives UTC dusk and dawn at solar altitude −18°, plus airless topocentric lunar altitude and illuminated fraction at ten-minute intervals. Historical forecasts without astronomy data return `night: null`.
 

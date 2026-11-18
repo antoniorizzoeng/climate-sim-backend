@@ -78,6 +78,17 @@ def test_past_query_around_midnight(skill_case):
         nowcast_skill.past_range(rows, now + timedelta(days=92))
 
 
+def test_reference_uses_saved_observer_weights(skill_case):
+    rows, payload = skill_case
+    _, errors = nowcast_skill.evaluate(
+        rows[:1], nowcast_skill.reference_hours(payload), dict(low=0, mid=0.5, high=1)
+    )
+    # 20% mid at half weight and 30% high overlap to 37% above the site.
+    assert errors["nowcast"]["total"] == pytest.approx(37)
+    assert errors["nowcast"]["clear"] == pytest.approx(37)
+    assert errors["nowcast"]["low"] == 10
+
+
 @pytest.mark.parametrize(
     ("section", "value", "message"),
     [("hourly_units", "fraction", "units"), ("hourly", [-1, 0, 10], "percentage")],

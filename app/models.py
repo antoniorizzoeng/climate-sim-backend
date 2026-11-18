@@ -23,10 +23,10 @@ class RequestModel(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def reject_null(cls, data):
-        # Optional properties may be omitted. Only fill_value is nullable.
+        # Optional properties may be omitted. Explicit null needs contract support.
         if isinstance(data, dict):
             for name, value in data.items():
-                if value is None and name != "fill_value":
+                if value is None and name not in ("fill_value", "elevation_m"):
                     raise ValueError(f"{name} cannot be null")
         return data
 
@@ -271,6 +271,7 @@ class NowcastParams(RequestModel):
     hours: int = Field(6, ge=1, le=12)
     resolution: int = Field(96, ge=16, le=256)
     blend_tau_hours: float = Field(DEFAULT_BLEND_TAU_HOURS, gt=0)
+    elevation_m: float | None = Field(None, ge=-500, le=9000)
 
     @model_validator(mode="after")
     def check_projection(self):

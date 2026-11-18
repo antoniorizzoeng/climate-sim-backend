@@ -30,7 +30,7 @@ def test_contract(client):
     assert (
         spec["info"]["version"]
         == client.get("/health").json()["api_version"]
-        == "1.4.0"
+        == "1.5.0"
     )
     expected = {
         (p, method.upper()): set(map(int, op["responses"]))

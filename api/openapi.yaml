@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: climate-sim API
-  version: 1.4.0
+  version: 1.5.0
   description: |
     Backend for the climate-sim frontend. Runs the MPI engine (climate-sim-mpi-cpp) locally with mpirun.
     Single local user, no authentication. One run executes at a time (all cores); others wait in a FIFO queue.
@@ -1000,6 +1000,33 @@ components:
           exclusiveMinimum: 0
           default: 2
           description: E-folding time in hours for the transport weight in the blend.
+        elevation_m:
+          type: [number, "null"]
+          minimum: -500
+          maximum: 9000
+          default: null
+          description: >
+            Observer elevation above sea level in metres (1.5.0). Null → the elevation Open-Meteo reports for the site
+            (90 m terrain model). Cloud below the observer is not counted in total/clear.
+
+    SiteElevation:
+      type: object
+      additionalProperties: false
+      required: [elevation_m, source, layer_weights]
+      properties:
+        elevation_m: { type: number }
+        source: { type: string, enum: [user, open-meteo] }
+        layer_weights:
+          type: object
+          additionalProperties: false
+          required: [low, mid, high]
+          description: >
+            Share of each layer counted as above the observer (0 = entirely below the site, 1 = entirely above),
+            derived once per record from the layer's altitude band at the site. total uses cover × weight per layer.
+          properties:
+            low: { type: number, minimum: 0, maximum: 1 }
+            mid: { type: number, minimum: 0, maximum: 1 }
+            high: { type: number, minimum: 0, maximum: 1 }
 
     CloudFraction:
       type: number
@@ -1011,17 +1038,24 @@ components:
       additionalProperties: false
       required: [low, mid, high, total, clear]
       properties:
-        low: { $ref: "#/components/schemas/CloudFraction" }
+        low: { $ref: "#/components/schemas/CloudFraction", description: Raw layer cover (including any part below the observer). }
         mid: { $ref: "#/components/schemas/CloudFraction" }
         high: { $ref: "#/components/schemas/CloudFraction" }
-        total: { $ref: "#/components/schemas/CloudFraction" }
+        total:
+          $ref: "#/components/schemas/CloudFraction"
+          description: >
+            Cloud above the observer (1.5.0): random overlap of cover × layer_weights. For the model series this replaces
+            Open-Meteo's own total when any weight is below 1. Records without site_elevation keep the 1.4 meaning.
         clear: { $ref: "#/components/schemas/CloudFraction", description: One minus total cloud fraction. }
 
     Nowcast:
       type: object
       additionalProperties: false
-      required: [id, status, created_at, params, data_time, layers, site, best_window, grid, night, message, expires_at]
+      required: [id, status, created_at, params, data_time, layers, site, best_window, grid, night, site_elevation, message, expires_at]
       properties:
+        site_elevation:
+          oneOf: [{ $ref: "#/components/schemas/SiteElevation" }, { type: "null" }]
+          description: Null for records created before 1.5.0 or before the forecast was fetched.
         id: { type: string }
         status: { type: string, enum: [fetching, queued, running, done, error] }
         created_at: { type: string, format: date-time }
@@ -1047,10 +1081,10 @@ components:
             properties:
               time: { type: string, format: date-time }
               nowcast: { $ref: "#/components/schemas/SkyCover", description: "Bilinear site samples. Total uses random overlap across layers." }
-              model: { $ref: "#/components/schemas/SkyCover", description: "Open-Meteo site layers and its own total, linearly interpolated between UTC hours." }
+              model: { $ref: "#/components/schemas/SkyCover", description: "Open-Meteo site layers, linearly interpolated between UTC hours. Total is cloud above the observer (SkyCover.total); records before 1.5.0 keep Open-Meteo's own total." }
               blend:
                 $ref: "#/components/schemas/SkyCover"
-                description: Exponentially weighted transport and model values for each layer and for total. Clear is one minus blended total.
+                description: Exponentially weighted transport and model values for each layer and for total (cloud above the observer). Clear is one minus blended total.
               jet_ms: { type: number, minimum: 0, description: Hourly 250 hPa wind speed in m/s held until the next hour. }
               seeing: { type: string, enum: [good, fair, poor], description: "Rule of thumb from jet_ms only. Good below 20, fair from 20 through 35, poor above 35." }
         best_window:

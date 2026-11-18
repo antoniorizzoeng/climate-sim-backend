@@ -14,7 +14,7 @@ if __name__ == "__main__" and not __package__:
 
 from app.models import DEFAULT_BLEND_TAU_HOURS
 from app.open_meteo import URL
-from app.sky import LEVELS, blend_site
+from app.sky import LEVELS, blend_site, cover
 
 HOUR = 3600
 CLOUD_FIELDS = {**{key: f"cloud_cover_{key}" for key in LEVELS}, "total": "cloud_cover"}
@@ -65,7 +65,7 @@ def reference_hours(payload):
     return reference
 
 
-def evaluate(rows, reference):
+def evaluate(rows, reference, weights=None):
     errors = {series: dict.fromkeys(METRICS, 0.0) for series in SERIES}
     matched = 0
     for row in rows:
@@ -77,6 +77,9 @@ def evaluate(rows, reference):
             continue
         weight = offset / HOUR
         values = [a + weight * (b - a) for a, b in zip(before, after)]
+        if weights is not None:
+            cloud = cover(*(v / 100 for v in values), weights=weights)
+            values[-1] = 100 * cloud["total"]
         values.append(100 - values[-1])
         for series in SERIES:
             for key, value in zip(METRICS, values):
@@ -119,7 +122,12 @@ def main():
             timeout=30,
         )
         response.raise_for_status()
-        matched, errors = evaluate(rows, reference_hours(response.json()))
+        elevation = record.get("site_elevation")
+        matched, errors = evaluate(
+            rows,
+            reference_hours(response.json()),
+            elevation["layer_weights"] if elevation else None,
+        )
     except (OSError, ValueError, TypeError, KeyError, httpx.HTTPError) as exc:
         parser.error(str(exc))
 
