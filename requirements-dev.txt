@@ -6,3 +6,6 @@ black==25.11.0
 isort==6.0.0
 jsonschema
 openapi-spec-validator>=0.7,<1
+fsspec[http]>=2024.6
+h5py>=3.10
+pyproj>=3.6
